@@ -20,7 +20,6 @@ USE_DB = bool(os.environ.get("DATABASE_URL"))
 TOKENS_FILE = os.path.join(os.path.dirname(__file__), "strava_tokens.json")
 HISTORY_FILE = os.path.join(os.path.dirname(__file__), "conversation_histories.json")
 SUMMARIES_FILE = os.path.join(os.path.dirname(__file__), "athlete_summaries.json")
-HEALTH_FILE = os.path.join(os.path.dirname(__file__), "apple_health.json")
 
 
 def load_json(path: str) -> dict:
@@ -40,7 +39,7 @@ def persist_get(key: str, default=None):
         from db import db_get
         return db_get(key, default) or default
     return load_json({"strava_tokens": TOKENS_FILE, "conversation_histories": HISTORY_FILE,
-                      "athlete_summaries": SUMMARIES_FILE, "apple_health": HEALTH_FILE}.get(key, "")) or default or {}
+                      "athlete_summaries": SUMMARIES_FILE}.get(key, "")) or default or {}
 
 
 def persist_set(key: str, value):
@@ -49,7 +48,7 @@ def persist_set(key: str, value):
         db_set(key, value)
     else:
         path = {"strava_tokens": TOKENS_FILE, "conversation_histories": HISTORY_FILE,
-                "athlete_summaries": SUMMARIES_FILE, "apple_health": HEALTH_FILE}.get(key)
+                "athlete_summaries": SUMMARIES_FILE}.get(key)
         if path:
             save_json(path, value)
 
@@ -61,7 +60,6 @@ if USE_DB:
 strava_tokens: dict = persist_get("strava_tokens", {})
 conversation_histories: dict = persist_get("conversation_histories", {})
 athlete_summaries: dict = persist_get("athlete_summaries", {})
-apple_health_data: dict = persist_get("apple_health", {})
 last_strava_check: dict[str, str] = {}
 
 
@@ -236,18 +234,6 @@ def get_ai_response(user_number: str, user_message: str) -> str:
         system += f"\n\n📋 Mémoire de tes échanges précédents avec Louis :\n{athlete_summaries[user_number]}"
     wod_done = any(kw in user_message.lower() for kw in ["wod terminé", "wod termine", "séance terminée", "seance terminee"])
 
-    health = apple_health_data.get(user_number)
-    if health:
-        system += (
-            f"\n\n⌚ Données Apple Watch (nuit/matin) :\n"
-            f"- Sommeil : {health.get('sleep', 'N/A')}\n"
-            f"- FC repos : {health.get('resting_hr', 'N/A')} bpm\n"
-            f"- HRV : {health.get('hrv', 'N/A')} ms\n"
-            f"- Pas hier : {health.get('steps', 'N/A')}\n"
-            f"- Calories actives : {health.get('calories', 'N/A')} kcal\n"
-            f"Utilise ces données pour évaluer l'état de récupération de Louis et adapter l'intensité du jour."
-        )
-
     strava_data = get_strava_activities(user_number)
     if strava_data:
         system += f"\n\n{strava_data}\n\nUtilise ces données pour personnaliser tes conseils si pertinent."
@@ -382,23 +368,6 @@ def health():
         "strava_connected": list(strava_tokens.keys()),
     }, 200
 
-
-@app.route("/apple-health", methods=["POST"])
-def apple_health():
-    data = request.get_json()
-    if not data:
-        return {"status": "error"}, 400
-    user_number = data.get("number", "whatsapp:+33618582944")
-    apple_health_data[user_number] = {
-        "sleep": data.get("sleep"),
-        "resting_hr": data.get("resting_hr"),
-        "hrv": data.get("hrv"),
-        "steps": data.get("steps"),
-        "calories": data.get("calories"),
-        "updated_at": datetime.now().isoformat(),
-    }
-    persist_set("apple_health", apple_health_data)
-    return {"status": "ok"}, 200
 
 
 @app.route("/reset", methods=["POST"])
