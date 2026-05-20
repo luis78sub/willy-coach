@@ -116,7 +116,6 @@ Ton style :
 Lors du premier contact uniquement (si aucune mémoire disponible), présente-toi brièvement."""
 
 MAX_HISTORY = 20
-athlete_summaries: dict[str, str] = {}  # compressed memory per user
 
 
 def get_anthropic_client():
@@ -222,17 +221,11 @@ def get_ai_response(user_number: str, user_message: str) -> str:
 
     paris = pytz.timezone("Europe/Paris")
     today = datetime.now(paris)
-    comp1 = datetime(2025, 11, 12, tzinfo=paris)
-    comp2 = datetime(2025, 12, 6, tzinfo=paris)
-    j_comp1 = (comp1 - today).days
-    j_comp2 = (comp2 - today).days
     heure = today.strftime("%H:%M")
     moment = "matin" if today.hour < 12 else "après-midi" if today.hour < 18 else "soir"
     date_context = (
         f"\n\n📅 Contexte temporel (heure France) :\n"
         f"- Aujourd'hui : {today.strftime('%A %d %B %Y')} — {heure} ({moment})\n"
-        f"- Compétition 1 (Open Double) : 12 novembre → J-{j_comp1}\n"
-        f"- Compétition 2 (Milan) : ~6 décembre → J-{j_comp2}\n"
         f"Adapte tes conseils à l'heure et au moment de la journée."
     )
 
@@ -271,54 +264,12 @@ def get_ai_response(user_number: str, user_message: str) -> str:
                 "Donne un feedback précis et motivant, et dis-lui ce que ça implique pour la suite."
             )
 
-    web_search_tool = {
-        "name": "web_search",
-        "description": "Recherche des informations récentes sur Hyrox, CrossFit, résultats de compétitions, méthodes d'entraînement, ou toute actualité sportive pertinente pour le coaching de Louis.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "La requête de recherche"}
-            },
-            "required": ["query"]
-        }
-    }
-
     response = get_anthropic_client().messages.create(
         model="claude-sonnet-4-6",
         max_tokens=1024,
         system=system,
-        tools=[web_search_tool],
         messages=history,
     )
-
-    # Handle tool use (web search)
-    if response.stop_reason == "tool_use":
-        tool_use_block = next(b for b in response.content if b.type == "tool_use")
-        query = tool_use_block.input["query"]
-
-        search_resp = requests.get(
-            "https://api.search.brave.com/res/v1/web/search",
-            headers={"Accept": "application/json", "X-Subscription-Token": os.environ.get("BRAVE_SEARCH_API_KEY", "")},
-            params={"q": query, "count": 3, "lang": "fr"},
-        )
-        if search_resp.ok:
-            results = search_resp.json().get("web", {}).get("results", [])
-            search_text = "\n".join(f"- {r['title']}: {r.get('description', '')}" for r in results)
-        else:
-            search_text = "Recherche indisponible."
-
-        tool_result_messages = list(history[:-1]) + [
-            {"role": "user", "content": history[-1]["content"]},
-            {"role": "assistant", "content": response.content},
-            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": tool_use_block.id, "content": search_text}]},
-        ]
-        response = get_anthropic_client().messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=1024,
-            system=system,
-            tools=[web_search_tool],
-            messages=tool_result_messages,
-        )
 
     assistant_message = next(b.text for b in response.content if hasattr(b, "text"))
     history.append({"role": "assistant", "content": assistant_message})
