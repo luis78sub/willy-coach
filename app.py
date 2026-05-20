@@ -365,6 +365,20 @@ def strava_callback():
     """
 
 
+@app.route("/admin/migrate", methods=["POST"])
+def admin_migrate():
+    data = request.get_json()
+    if not data or data.get("secret") != os.environ.get("MIGRATE_SECRET", "willy-migrate-2026"):
+        return {"status": "unauthorized"}, 401
+    if "conversation_histories" in data:
+        conversation_histories.update(data["conversation_histories"])
+        persist_set("conversation_histories", conversation_histories)
+    if "athlete_summaries" in data:
+        athlete_summaries.update(data["athlete_summaries"])
+        persist_set("athlete_summaries", athlete_summaries)
+    return {"status": "ok", "histories": len(conversation_histories), "summaries": len(athlete_summaries)}, 200
+
+
 @app.route("/health", methods=["GET"])
 def health():
     return {
