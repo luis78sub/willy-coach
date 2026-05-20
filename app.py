@@ -61,20 +61,12 @@ if USE_DB:
 strava_tokens: dict = persist_get("strava_tokens", {})
 conversation_histories: dict = persist_get("conversation_histories", {})
 athlete_summaries: dict = persist_get("athlete_summaries", {})
-last_strava_check: dict[str, str] = {}
+last_strava_fetch: dict[str, datetime] = {}
+strava_cache: dict[str, str] = {}
 
 
 def save_strava_tokens(tokens: dict):
     persist_set("strava_tokens", tokens)
-
-
-def is_new_session(user_number: str) -> bool:
-    paris = pytz.timezone("Europe/Paris")
-    today = datetime.now(paris).strftime("%Y-%m-%d")
-    if last_strava_check.get(user_number) != today:
-        last_strava_check[user_number] = today
-        return True
-    return False
 
 SYSTEM_PROMPT = """Tu es Willy Georges, athlète CrossFit & Hyrox français, coach et fondateur de WYS Training.
 
@@ -220,26 +212,37 @@ def get_ai_response(user_number: str, user_message: str) -> str:
         persist_set("athlete_summaries", athlete_summaries)
 
     paris = pytz.timezone("Europe/Paris")
-    today = datetime.now(paris)
-    heure = today.strftime("%H:%M")
-    moment = "matin" if today.hour < 12 else "après-midi" if today.hour < 18 else "soir"
+    now = datetime.now(paris)
+    heure = now.strftime("%H:%M")
+    moment = "matin" if now.hour < 12 else "après-midi" if now.hour < 18 else "soir"
     date_context = (
         f"\n\n📅 Contexte temporel (heure France) :\n"
-        f"- Aujourd'hui : {today.strftime('%A %d %B %Y')} — {heure} ({moment})\n"
+        f"- Aujourd'hui : {now.strftime('%A %d %B %Y')} — {heure} ({moment})\n"
         f"Adapte tes conseils à l'heure et au moment de la journée."
     )
 
-    new_session = is_new_session(user_number)
+    wod_done = any(kw in user_message.lower() for kw in ["wod terminé", "wod termine", "séance terminée", "seance terminee"])
+
+    last_fetch = last_strava_fetch.get(user_number)
+    is_new_session = last_fetch is None or last_fetch.strftime("%Y-%m-%d") != now.strftime("%Y-%m-%d")
+    one_hour_passed = last_fetch is None or (now - last_fetch).total_seconds() >= 3600
+
+    if is_new_session or one_hour_passed or wod_done:
+        strava_data = get_strava_activities(user_number)
+        if strava_data:
+            strava_cache[user_number] = strava_data
+        last_strava_fetch[user_number] = now
+    else:
+        strava_data = strava_cache.get(user_number, "")
+        is_new_session = False
 
     system = SYSTEM_PROMPT + date_context
     if user_number in athlete_summaries:
         system += f"\n\n📋 Mémoire de tes échanges précédents avec Louis :\n{athlete_summaries[user_number]}"
-    wod_done = any(kw in user_message.lower() for kw in ["wod terminé", "wod termine", "séance terminée", "seance terminee"])
 
-    strava_data = get_strava_activities(user_number)
     if strava_data:
         system += f"\n\n{strava_data}\n\nUtilise ces données pour personnaliser tes conseils si pertinent."
-        if new_session:
+        if is_new_session:
             system += (
                 "\n\n⚡ DÉBUT DE SESSION : commence ta réponse par une analyse rapide "
                 "des dernières activités Strava de Louis (ce qu'il a fait, comment il a performé, "
