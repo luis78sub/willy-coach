@@ -37,7 +37,8 @@ def save_json(path: str, data: dict):
 def persist_get(key: str, default=None):
     if USE_DB:
         from db import db_get
-        return db_get(key, default) or default
+        result = db_get(key, None)
+        return result if result is not None else default
     return load_json({"strava_tokens": TOKENS_FILE, "conversation_histories": HISTORY_FILE,
                       "athlete_summaries": SUMMARIES_FILE}.get(key, "")) or default or {}
 
@@ -68,7 +69,8 @@ def save_strava_tokens(tokens: dict):
 
 
 def is_new_session(user_number: str) -> bool:
-    today = datetime.now().strftime("%Y-%m-%d")
+    paris = pytz.timezone("Europe/Paris")
+    today = datetime.now(paris).strftime("%Y-%m-%d")
     if last_strava_check.get(user_number) != today:
         last_strava_check[user_number] = today
         return True
