@@ -133,14 +133,17 @@ def refresh_strava_token(user_number: str) -> bool:
     return False
 
 
-def get_strava_activities(user_number: str, limit: int = 7) -> str:
+def get_strava_activities(user_number: str, limit: int = 7, after: int = None) -> str:
     if not refresh_strava_token(user_number):
         return ""
     token = strava_tokens[user_number]["access_token"]
+    params = {"per_page": limit}
+    if after:
+        params["after"] = after
     resp = requests.get(
         "https://www.strava.com/api/v3/athlete/activities",
         headers={"Authorization": f"Bearer {token}"},
-        params={"per_page": limit},
+        params=params,
     )
     if not resp.ok:
         return ""
@@ -191,7 +194,7 @@ def compress_history(user_number: str, history: list[dict]) -> str:
 
     response = get_anthropic_client().messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=600,
+        max_tokens=1200,
         system="Tu es un assistant mémoire de coaching sportif. Sois concis, factuel et cumulatif.",
         messages=[{"role": "user", "content": prompt}],
     )
@@ -228,10 +231,13 @@ def get_ai_response(user_number: str, user_message: str) -> str:
     one_hour_passed = last_fetch is None or (now - last_fetch).total_seconds() >= 3600
 
     if is_new_session or one_hour_passed or wod_done:
-        strava_data = get_strava_activities(user_number)
-        if strava_data:
-            strava_cache[user_number] = strava_data
-        last_strava_fetch[user_number] = now
+        fresh = get_strava_activities(user_number)
+        if fresh:
+            strava_cache[user_number] = fresh
+            last_strava_fetch[user_number] = now
+        else:
+            is_new_session = False
+        strava_data = strava_cache.get(user_number, "")
     else:
         strava_data = strava_cache.get(user_number, "")
         is_new_session = False
@@ -382,6 +388,7 @@ def reset_conversation():
     number = data.get("number") if data else None
     if number and number in conversation_histories:
         del conversation_histories[number]
+        persist_set("conversation_histories", conversation_histories)
         return {"status": "reset", "number": number}, 200
     return {"status": "not_found"}, 404
 
@@ -398,8 +405,9 @@ def send_whatsapp(to: str, message: str):
 def weekly_summary():
     paris = pytz.timezone("Europe/Paris")
     today = datetime.now(paris)
+    week_ago = int((today.timestamp()) - 7 * 86400)
     for user_number, token_data in strava_tokens.items():
-        strava_data = get_strava_activities(user_number, limit=10)
+        strava_data = get_strava_activities(user_number, limit=10, after=week_ago)
         if not strava_data:
             continue
         summary = athlete_summaries.get(user_number, "")
