@@ -65,6 +65,48 @@ athlete_summaries: dict = persist_get("athlete_summaries", {})
 last_strava_fetch: dict[str, datetime] = {}
 strava_cache: dict[str, str] = {}
 
+# Locks per user pour éviter race condition sur l'état partagé (async pattern)
+user_locks: dict[str, threading.Lock] = {}
+_user_locks_master = threading.Lock()
+
+
+def get_user_lock(user_number: str) -> threading.Lock:
+    with _user_locks_master:
+        if user_number not in user_locks:
+            user_locks[user_number] = threading.Lock()
+        return user_locks[user_number]
+
+
+def is_valid_summary(s: str) -> bool:
+    """Garde-fou contre les compressions ratées qui produisent un résumé vide ou inutile."""
+    if not s or len(s) < 200:
+        return False
+    bad_phrases = [
+        "aucune information",
+        "aucune donnée",
+        "pas encore renseigné",
+        "pas d'information",
+        "rien à signaler",
+        "vide",
+    ]
+    return not any(p in s.lower() for p in bad_phrases)
+
+
+def backup_summary(user_number: str):
+    """Snapshot le résumé actuel avant compression pour permettre rollback."""
+    current = athlete_summaries.get(user_number)
+    if not current:
+        return
+    key = f"athlete_summaries_history__{user_number}"
+    snapshots = persist_get(key, []) or []
+    snapshots.append({
+        "timestamp": datetime.now().isoformat(),
+        "summary": current,
+    })
+    # Garde les 10 derniers snapshots
+    snapshots = snapshots[-10:]
+    persist_set(key, snapshots)
+
 
 def save_strava_tokens(tokens: dict):
     persist_set("strava_tokens", tokens)
@@ -275,15 +317,21 @@ def compress_history(user_number: str, history: list[dict]) -> str:
         for m in history
     )
     prompt = (
-        "Tu es un assistant mémoire pour un coach sportif IA. "
-        "Mets à jour le profil de suivi de l'athlète Louis en intégrant les nouveaux échanges. "
-        "Le résumé final doit être cumulatif : il intègre tout ce qui a été dit depuis le début. "
-        "Structure en bullet points concis :\n"
+        "Tu es un assistant mémoire pour un coach sportif IA.\n"
+        "Mets à jour le profil de suivi de l'athlète Louis en intégrant les nouveaux échanges.\n\n"
+        "⚠️ RÈGLE ABSOLUE : le résumé doit être CUMULATIF.\n"
+        "Tu intègres TOUT ce qui était déjà dans le résumé actuel + les nouveaux faits des échanges.\n"
+        "JAMAIS supprimer un fait précis déjà capturé (PR, séance, ressenti, allure, FC, recommandation).\n"
+        "Tu peux REFORMULER pour gagner en clarté, mais tu ne PERDS RIEN.\n"
+        "Si tu manques de matière, garde l'ancien résumé tel quel et ajoute juste les nouveautés.\n\n"
+        "Structure obligatoire en bullet points :\n"
         "- Profil Louis (niveau, objectifs, contraintes, historique sportif)\n"
         "- Programmes donnés et progression observée\n"
         "- Points de vigilance (blessures, fatigue, points faibles)\n"
         "- Dernières recommandations Willy\n"
         "- Ce que Louis a partagé d'important sur sa vie/agenda/motivation\n\n"
+        "Si l'historique ne contient rien de nouveau d'intéressant, RETOURNE l'ancien résumé tel quel "
+        "(jamais 'Aucune information disponible' ou similaire — ce serait une régression).\n\n"
     )
     if existing_summary:
         prompt += f"RÉSUMÉ ACTUEL À METTRE À JOUR :\n{existing_summary}\n\n"
@@ -299,6 +347,13 @@ def compress_history(user_number: str, history: list[dict]) -> str:
 
 
 def get_ai_response(user_number: str, user_message: str) -> str:
+    # Lock par utilisateur : empêche les race conditions quand plusieurs threads
+    # async traitent des messages du même user en parallèle (sinon corruption mémoire)
+    with get_user_lock(user_number):
+        return _get_ai_response_locked(user_number, user_message)
+
+
+def _get_ai_response_locked(user_number: str, user_message: str) -> str:
     if user_number not in conversation_histories:
         conversation_histories[user_number] = []
 
@@ -306,10 +361,17 @@ def get_ai_response(user_number: str, user_message: str) -> str:
     history.append({"role": "user", "content": user_message})
 
     if len(history) > MAX_HISTORY:
-        athlete_summaries[user_number] = compress_history(user_number, history[:-10])
+        # SAFEGUARD : backup avant compression + validation post-compression
+        new_summary = compress_history(user_number, history[:-10])
+        if is_valid_summary(new_summary):
+            backup_summary(user_number)  # snapshot l'ancien avant écrasement
+            athlete_summaries[user_number] = new_summary
+            persist_set("athlete_summaries", athlete_summaries)
+            print(f"[compress] OK pour {user_number} — {len(new_summary)} chars, ancien backup'd")
+        else:
+            print(f"[compress] REJETÉ pour {user_number} — résumé invalide ({len(new_summary)} chars), ancien conservé")
         history = history[-10:]
         conversation_histories[user_number] = history
-        persist_set("athlete_summaries", athlete_summaries)
 
     paris = pytz.timezone("Europe/Paris")
     now = datetime.now(paris)
@@ -498,6 +560,92 @@ def strava_callback():
     """
 
 
+
+
+@app.route("/admin/memory", methods=["POST"])
+def admin_memory():
+    """
+    Endpoint de gestion mémoire (debug + restauration).
+    Actions :
+    - dump : retourne l'état mémoire actuel d'un user
+    - list_backups : liste les snapshots de résumé sauvegardés
+    - restore : réécrit le résumé d'un user (ex: restauration depuis backup local)
+    - restore_from_backup : restaure depuis le snapshot N (index dans backups)
+    """
+    data = request.get_json()
+    if not data or data.get("secret") != "willy-memory-2026":
+        return {"status": "unauthorized"}, 401
+    action = data.get("action")
+    user = data.get("user")
+    if not user:
+        return {"status": "user required"}, 400
+
+    if action == "dump":
+        summary = athlete_summaries.get(user, "")
+        history = conversation_histories.get(user, [])
+        backups = persist_get(f"athlete_summaries_history__{user}", []) or []
+        return {
+            "status": "ok",
+            "user": user,
+            "summary_length": len(summary),
+            "summary_preview": summary[:500],
+            "summary_full": summary,
+            "history_count": len(history),
+            "history_preview_last_5": history[-5:],
+            "backups_count": len(backups),
+            "backups_summary": [
+                {"timestamp": b["timestamp"], "length": len(b["summary"])}
+                for b in backups
+            ],
+        }, 200
+
+    if action == "list_backups":
+        backups = persist_get(f"athlete_summaries_history__{user}", []) or []
+        return {
+            "status": "ok",
+            "backups": [
+                {
+                    "index": i,
+                    "timestamp": b["timestamp"],
+                    "length": len(b["summary"]),
+                    "preview": b["summary"][:300],
+                }
+                for i, b in enumerate(backups)
+            ],
+        }, 200
+
+    if action == "restore" and "summary" in data:
+        old_summary = athlete_summaries.get(user, "")
+        if old_summary:
+            backup_summary(user)  # backup l'actuel avant de l'écraser
+        athlete_summaries[user] = data["summary"]
+        persist_set("athlete_summaries", athlete_summaries)
+        return {
+            "status": "ok",
+            "restored_for": user,
+            "new_length": len(data["summary"]),
+            "old_length": len(old_summary),
+        }, 200
+
+    if action == "restore_from_backup" and "index" in data:
+        backups = persist_get(f"athlete_summaries_history__{user}", []) or []
+        idx = data["index"]
+        if idx < 0 or idx >= len(backups):
+            return {"status": "index out of range", "backups_count": len(backups)}, 400
+        chosen = backups[idx]["summary"]
+        old_summary = athlete_summaries.get(user, "")
+        if old_summary:
+            backup_summary(user)
+        athlete_summaries[user] = chosen
+        persist_set("athlete_summaries", athlete_summaries)
+        return {
+            "status": "ok",
+            "restored_from_timestamp": backups[idx]["timestamp"],
+            "new_length": len(chosen),
+            "old_length": len(old_summary),
+        }, 200
+
+    return {"status": "unknown action", "valid_actions": ["dump", "list_backups", "restore", "restore_from_backup"]}, 400
 
 
 @app.route("/health", methods=["GET"])
