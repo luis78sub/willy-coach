@@ -1,5 +1,6 @@
 import os
 import json
+import threading
 import requests
 from flask import Flask, request, redirect
 from twilio.twiml.messaging_response import MessagingResponse
@@ -379,6 +380,26 @@ def get_ai_response(user_number: str, user_message: str) -> str:
     return assistant_message
 
 
+def process_message_async(sender_number: str, incoming_message: str):
+    """
+    Génère la réponse Willy en arrière-plan et l'envoie via Twilio REST API.
+    Évite le timeout 15s de Twilio sur le webhook synchrone.
+    """
+    try:
+        ai_response = get_ai_response(sender_number, incoming_message)
+        if len(ai_response) > 1500:
+            for i in range(0, len(ai_response), 1500):
+                send_whatsapp(sender_number, ai_response[i:i+1500])
+        else:
+            send_whatsapp(sender_number, ai_response)
+    except Exception as e:
+        print(f"[async] error processing message for {sender_number}: {e}")
+        try:
+            send_whatsapp(sender_number, "Désolé, j'ai eu un souci technique. Renvoie ton message 🙏")
+        except Exception as e2:
+            print(f"[async] failed to send error message: {e2}")
+
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     incoming_message = request.form.get("Body", "").strip()
@@ -389,7 +410,7 @@ def webhook():
 
     twiml = MessagingResponse()
 
-    # Commande de connexion Strava
+    # Commande de connexion Strava → réponse synchrone immédiate (pas d'IA, < 100ms)
     if incoming_message.lower() in ["strava", "connecter strava", "connect strava"]:
         auth_url = (
             f"https://www.strava.com/oauth/authorize"
@@ -402,13 +423,14 @@ def webhook():
         twiml.message(f"Connecte ton compte Strava en cliquant sur ce lien 👇\n{auth_url}")
         return str(twiml)
 
-    ai_response = get_ai_response(sender_number, incoming_message)
-
-    if len(ai_response) > 1500:
-        for i in range(0, len(ai_response), 1500):
-            twiml.message(ai_response[i:i+1500])
-    else:
-        twiml.message(ai_response)
+    # Tous les autres messages : traitement async pour éviter timeout Twilio 15s
+    # → on retourne immédiatement une réponse TwiML vide
+    # → le thread d'arrière-plan génère la réponse IA et l'envoie via Twilio REST
+    threading.Thread(
+        target=process_message_async,
+        args=(sender_number, incoming_message),
+        daemon=True,
+    ).start()
 
     return str(twiml)
 
