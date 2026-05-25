@@ -487,17 +487,17 @@ def process_message_async(sender_number: str, incoming_message: str):
     """
     try:
         ai_response = get_ai_response(sender_number, incoming_message)
-        if len(ai_response) > 1500:
-            for i in range(0, len(ai_response), 1500):
-                send_whatsapp(sender_number, ai_response[i:i+1500])
+        # Split à 3500 chars (WhatsApp accepte 4096, on garde une marge sécurité)
+        # → réduit massivement le nombre de segments Twilio facturés
+        if len(ai_response) > 3500:
+            for i in range(0, len(ai_response), 3500):
+                send_whatsapp(sender_number, ai_response[i:i+3500])
         else:
             send_whatsapp(sender_number, ai_response)
     except Exception as e:
-        print(f"[async] error processing message for {sender_number}: {e}")
-        try:
-            send_whatsapp(sender_number, "Désolé, j'ai eu un souci technique. Renvoie ton message 🙏")
-        except Exception as e2:
-            print(f"[async] failed to send error message: {e2}")
+        # Sur crash thread : on log mais on n'envoie PAS de message d'excuse
+        # (économie de segments Twilio + tu vois que Willy n'a pas répondu, tu sais qu'il y a un souci)
+        print(f"[async] ERROR processing message for {sender_number}: {type(e).__name__}: {e}")
 
 
 @app.route("/webhook", methods=["POST"])
@@ -715,12 +715,27 @@ def reset_conversation():
 
 
 def send_whatsapp(to: str, message: str):
+    """
+    Envoie un message WhatsApp via Twilio REST.
+    Gère gracieusement l'erreur 63038 (limite quotidienne sandbox trial dépassée)
+    pour ne pas crasher tout le thread async.
+    """
     client = TwilioClient(os.environ["TWILIO_ACCOUNT_SID"], os.environ["TWILIO_AUTH_TOKEN"])
-    client.messages.create(
-        from_="whatsapp:+14155238886",
-        to=to,
-        body=message,
-    )
+    try:
+        client.messages.create(
+            from_="whatsapp:+14155238886",
+            to=to,
+            body=message,
+        )
+    except Exception as e:
+        err_str = str(e)
+        if "63038" in err_str:
+            print(f"[twilio] LIMITE QUOTIDIENNE ATTEINTE (63038) — message non livré à {to}. "
+                  f"Upgrade Twilio à $20 pour lever la limite, ou attends 24h.")
+        elif "63016" in err_str:
+            print(f"[twilio] FENÊTRE 24h FERMÉE (63016) — {to} doit envoyer un message pour rouvrir la session.")
+        else:
+            print(f"[twilio] erreur d'envoi à {to}: {type(e).__name__}: {e}")
 
 
 def weekly_summary():
@@ -772,7 +787,7 @@ def weekly_summary():
         )
         response = get_anthropic_client().messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=2000,
+            max_tokens=1500,  # bilan dense mais plus économe en segments WhatsApp
             messages=[{"role": "user", "content": prompt}],
         )
         bilan = response.content[0].text
