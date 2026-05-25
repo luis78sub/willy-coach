@@ -77,19 +77,40 @@ def get_user_lock(user_number: str) -> threading.Lock:
         return user_locks[user_number]
 
 
-def is_valid_summary(s: str) -> bool:
-    """Garde-fou contre les compressions ratées qui produisent un résumé vide ou inutile."""
-    if not s or len(s) < 200:
-        return False
+def is_valid_summary(new: str, old: str = "") -> tuple[bool, str]:
+    """
+    Garde-fou contre les compressions ratées.
+    Retourne (is_valid, reason). Plus strict que la v1 :
+    - Longueur minimale 200 chars
+    - Pas de phrases interdites (résumé vide ou méta)
+    - Si on a un ancien résumé : la perte ne doit pas dépasser 30%
+    """
+    if not new or len(new) < 200:
+        return False, f"trop court ({len(new)} chars, min 200)"
+
     bad_phrases = [
         "aucune information",
         "aucune donnée",
         "pas encore renseigné",
         "pas d'information",
         "rien à signaler",
-        "vide",
+        # Phrases méta qui montrent que le LLM répond à une question au lieu de résumer
+        "tu as raison de",
+        "je vais être honnête",
+        "ce que je suis ici",
+        "je suis un assistant",
     ]
-    return not any(p in s.lower() for p in bad_phrases)
+    found = next((p for p in bad_phrases if p in new.lower()), None)
+    if found:
+        return False, f"contient phrase interdite '{found}'"
+
+    # Si on a un ancien résumé valide, on vérifie qu'on ne perd pas trop
+    if old and len(old) >= 200:
+        ratio = len(new) / len(old)
+        if ratio < 0.70:  # perte > 30%
+            return False, f"perte excessive : {len(new)} chars vs {len(old)} avant ({int((1-ratio)*100)}% perdu)"
+
+    return True, "OK"
 
 
 def backup_summary(user_number: str):
@@ -244,13 +265,15 @@ Premier contact (si aucune mémoire disponible) : présente-toi brièvement.
 - Confusion de jour (vérifie systématiquement la date)
 - Réponse < 100 mots quand Louis demande un programme
 - "Ma gueule" ou familiarité quand tu viens de te planter
-- Minimum scolaire 3 séances/semaine (Louis fait 5-7 avec doubles)"""
+- Minimum scolaire 3 séances/semaine (Louis fait 5-7 avec doubles)
+- Clore une conversation sur "à mercredi" / "à demain" / "à plus" / "reviens dans X jours" / "bonne récup, à plus tard" → c'est LOUIS qui décide quand il revient, pas toi. Tu finis tes messages en restant ouvert à la suite de l'échange, sans pousser Louis à partir."""
 
 MAX_HISTORY = 20
 
 
 def get_anthropic_client():
-    return anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    # timeout=60s : sécurité contre un thread qui hang et bloque le lock per-user
+    return anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"], timeout=60.0)
 
 
 def refresh_strava_token(user_number: str) -> bool:
@@ -259,12 +282,20 @@ def refresh_strava_token(user_number: str) -> bool:
         return False
     if token_data.get("expires_at", 0) > datetime.now().timestamp():
         return True  # still valid
-    resp = requests.post("https://www.strava.com/oauth/token", data={
-        "client_id": os.environ["STRAVA_CLIENT_ID"],
-        "client_secret": os.environ["STRAVA_CLIENT_SECRET"],
-        "grant_type": "refresh_token",
-        "refresh_token": token_data["refresh_token"],
-    })
+    try:
+        resp = requests.post(
+            "https://www.strava.com/oauth/token",
+            data={
+                "client_id": os.environ["STRAVA_CLIENT_ID"],
+                "client_secret": os.environ["STRAVA_CLIENT_SECRET"],
+                "grant_type": "refresh_token",
+                "refresh_token": token_data["refresh_token"],
+            },
+            timeout=10,
+        )
+    except requests.RequestException as e:
+        print(f"[strava] refresh token timeout/error: {e}")
+        return False
     if resp.ok:
         strava_tokens[user_number] = resp.json()
         save_strava_tokens(strava_tokens)
@@ -279,11 +310,16 @@ def get_strava_activities(user_number: str, limit: int = 7, after: int = None) -
     params = {"per_page": limit}
     if after:
         params["after"] = after
-    resp = requests.get(
-        "https://www.strava.com/api/v3/athlete/activities",
-        headers={"Authorization": f"Bearer {token}"},
-        params=params,
-    )
+    try:
+        resp = requests.get(
+            "https://www.strava.com/api/v3/athlete/activities",
+            headers={"Authorization": f"Bearer {token}"},
+            params=params,
+            timeout=10,
+        )
+    except requests.RequestException as e:
+        print(f"[strava] get activities timeout/error: {e}")
+        return ""
     if not resp.ok:
         return ""
     activities = resp.json()
@@ -362,14 +398,16 @@ def _get_ai_response_locked(user_number: str, user_message: str) -> str:
 
     if len(history) > MAX_HISTORY:
         # SAFEGUARD : backup avant compression + validation post-compression
+        old_summary = athlete_summaries.get(user_number, "")
         new_summary = compress_history(user_number, history[:-10])
-        if is_valid_summary(new_summary):
+        is_valid, reason = is_valid_summary(new_summary, old_summary)
+        if is_valid:
             backup_summary(user_number)  # snapshot l'ancien avant écrasement
             athlete_summaries[user_number] = new_summary
             persist_set("athlete_summaries", athlete_summaries)
-            print(f"[compress] OK pour {user_number} — {len(new_summary)} chars, ancien backup'd")
+            print(f"[compress] OK pour {user_number} — {len(old_summary)} → {len(new_summary)} chars, ancien backup'd")
         else:
-            print(f"[compress] REJETÉ pour {user_number} — résumé invalide ({len(new_summary)} chars), ancien conservé")
+            print(f"[compress] REJETÉ pour {user_number} — {reason}. Ancien résumé conservé ({len(old_summary)} chars)")
         history = history[-10:]
         conversation_histories[user_number] = history
 
@@ -534,12 +572,19 @@ def strava_callback():
     if not code:
         return "Erreur : pas de code Strava.", 400
 
-    resp = requests.post("https://www.strava.com/oauth/token", data={
-        "client_id": os.environ["STRAVA_CLIENT_ID"],
-        "client_secret": os.environ["STRAVA_CLIENT_SECRET"],
-        "code": code,
-        "grant_type": "authorization_code",
-    })
+    try:
+        resp = requests.post(
+            "https://www.strava.com/oauth/token",
+            data={
+                "client_id": os.environ["STRAVA_CLIENT_ID"],
+                "client_secret": os.environ["STRAVA_CLIENT_SECRET"],
+                "code": code,
+                "grant_type": "authorization_code",
+            },
+            timeout=10,
+        )
+    except requests.RequestException as e:
+        return f"Erreur réseau Strava : {e}", 500
 
     if not resp.ok:
         return "Erreur lors de l'échange du token Strava.", 400
