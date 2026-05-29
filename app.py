@@ -17,6 +17,11 @@ app = Flask(__name__)
 
 USE_DB = bool(os.environ.get("DATABASE_URL"))
 
+# Secret des endpoints admin. À définir dans l'environnement Render (ADMIN_SECRET).
+# Fallback sur l'ancienne valeur pour ne pas casser le dev local, mais EN PROD
+# il faut impérativement définir ADMIN_SECRET (le repo est public).
+ADMIN_SECRET = os.environ.get("ADMIN_SECRET") or "willy-memory-2026"
+
 # JSON fallback (local dev)
 TOKENS_FILE = os.path.join(os.path.dirname(__file__), "strava_tokens.json")
 HISTORY_FILE = os.path.join(os.path.dirname(__file__), "conversation_histories.json")
@@ -618,7 +623,7 @@ def admin_memory():
     - restore_from_backup : restaure depuis le snapshot N (index dans backups)
     """
     data = request.get_json()
-    if not data or data.get("secret") != "willy-memory-2026":
+    if not data or data.get("secret") != ADMIN_SECRET:
         return {"status": "unauthorized"}, 401
     action = data.get("action")
     user = data.get("user")
@@ -691,6 +696,57 @@ def admin_memory():
         }, 200
 
     return {"status": "unknown action", "valid_actions": ["dump", "list_backups", "restore", "restore_from_backup"]}, 400
+
+
+@app.route("/admin/backup", methods=["POST"])
+def admin_backup():
+    """
+    Dump complet de la base (toutes les clés du store) pour backup externe.
+    Utilisé par le workflow GitHub Actions de backup quotidien.
+    """
+    data = request.get_json(silent=True) or {}
+    if data.get("secret") != ADMIN_SECRET:
+        return {"status": "unauthorized"}, 401
+    if not USE_DB:
+        return {"status": "no database (local mode)"}, 400
+    try:
+        from db import db_dump_all
+        dump = db_dump_all()
+        return {
+            "status": "ok",
+            "generated_at": datetime.now(pytz.timezone("Europe/Paris")).isoformat(),
+            "keys_count": len(dump),
+            "data": dump,
+        }, 200
+    except Exception as e:
+        return {"status": "error", "error": str(e)}, 500
+
+
+@app.route("/admin/restore_all", methods=["POST"])
+def admin_restore_all():
+    """
+    Réinjecte un dump complet dans la base (restauration disaster recovery).
+    Body : {"secret": ..., "data": {<dump complet>}}
+    """
+    data = request.get_json(silent=True) or {}
+    if data.get("secret") != ADMIN_SECRET:
+        return {"status": "unauthorized"}, 401
+    if not USE_DB:
+        return {"status": "no database (local mode)"}, 400
+    dump = data.get("data")
+    if not isinstance(dump, dict) or not dump:
+        return {"status": "data (dict non vide) required"}, 400
+    try:
+        from db import db_restore_all
+        count = db_restore_all(dump)
+        # Recharge l'état en mémoire après restauration
+        global strava_tokens, conversation_histories, athlete_summaries
+        strava_tokens = persist_get("strava_tokens", {})
+        conversation_histories = persist_get("conversation_histories", {})
+        athlete_summaries = persist_get("athlete_summaries", {})
+        return {"status": "ok", "keys_restored": count}, 200
+    except Exception as e:
+        return {"status": "error", "error": str(e)}, 500
 
 
 @app.route("/health", methods=["GET"])

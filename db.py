@@ -38,3 +38,25 @@ def db_set(key: str, value):
             conn.commit()
     except Exception as e:
         print(f"db_set error: {e}")
+
+def db_dump_all() -> dict:
+    """Retourne TOUTE la base (toutes les clés du store) sous forme de dict."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT key, value FROM store")
+            rows = cur.fetchall()
+            return {row[0]: row[1] for row in rows}
+
+def db_restore_all(data: dict) -> int:
+    """Réinjecte un dump complet dans le store (upsert clé par clé). Retourne le nb de clés écrites."""
+    count = 0
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            for key, value in data.items():
+                cur.execute("""
+                    INSERT INTO store (key, value) VALUES (%s, %s)
+                    ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+                """, (key, json.dumps(value)))
+                count += 1
+        conn.commit()
+    return count
