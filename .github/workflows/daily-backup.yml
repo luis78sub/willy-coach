@@ -1,0 +1,39 @@
+name: Daily DB backup
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch DB dump from Willy
+        run: |
+          curl -s -f -X POST https://willy-coach.onrender.com/admin/backup \
+            -H "Content-Type: application/json" \
+            -d "{\"secret\":\"${{ secrets.WILLY_ADMIN_SECRET }}\"}" \
+            -o backup.json
+          SIZE=$(wc -c < backup.json)
+          echo "Dump récupéré : $SIZE octets"
+          if [ "$SIZE" -lt 50 ]; then
+            echo "::error::Dump trop petit, échec probable"
+            cat backup.json
+            exit 1
+          fi
+
+      - name: Encrypt backup
+        run: |
+          openssl enc -aes-256-cbc -pbkdf2 -salt \
+            -in backup.json \
+            -out backup.json.enc \
+            -pass pass:"${{ secrets.BACKUP_PASSPHRASE }}"
+          rm backup.json
+
+      - name: Upload encrypted artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: willy-db-backup-${{ github.run_id }}
+          path: backup.json.enc
+          retention-days: 90
