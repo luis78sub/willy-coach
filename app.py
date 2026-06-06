@@ -1,5 +1,6 @@
 import os
 import json
+import copy
 import threading
 import requests
 from flask import Flask, request, redirect
@@ -67,6 +68,11 @@ if USE_DB:
 strava_tokens: dict = persist_get("strava_tokens", {})
 conversation_histories: dict = persist_get("conversation_histories", {})
 athlete_summaries: dict = persist_get("athlete_summaries", {})
+# Mémoire STRUCTURÉE (données chiffrées requêtables) à côté du résumé texte.
+# Forme par user : {"benchmarks": {nom: [{date, value, note}]},
+#                   "body_metrics": {nom: [{date, value}]},
+#                   "blessures": [{date, zone, note, statut}]}
+athlete_data: dict = persist_get("athlete_data", {})
 last_strava_fetch: dict[str, datetime] = {}
 strava_cache: dict[str, str] = {}
 
@@ -132,6 +138,153 @@ def backup_summary(user_number: str):
     # Garde les 10 derniers snapshots
     snapshots = snapshots[-10:]
     persist_set(key, snapshots)
+
+
+def _empty_athlete_data() -> dict:
+    return {"benchmarks": {}, "body_metrics": {}, "blessures": []}
+
+
+def backup_athlete_data(user_number: str):
+    """Snapshot des données structurées avant fusion (rollback possible)."""
+    current = athlete_data.get(user_number)
+    if not current:
+        return
+    key = f"athlete_data_history__{user_number}"
+    snapshots = persist_get(key, []) or []
+    snapshots.append({"timestamp": datetime.now().isoformat(), "data": current})
+    snapshots = snapshots[-10:]
+    persist_set(key, snapshots)
+
+
+def merge_structured_data(existing: dict, extracted: dict) -> tuple[dict, int]:
+    """
+    Fusion ADDITIVE : ajoute les nouveaux points de données, ne supprime JAMAIS.
+    Dédup par (nom, date, valeur). Retourne (data_fusionnée, nb_points_ajoutés).
+    """
+    # Deep-copy : on ne mute jamais l'objet existant in-place (le backup pré-fusion
+    # dans update_athlete_data doit pouvoir snapshotter l'état AVANT modification).
+    data = copy.deepcopy(existing) if existing else _empty_athlete_data()
+    data.setdefault("benchmarks", {})
+    data.setdefault("body_metrics", {})
+    data.setdefault("blessures", [])
+    added = 0
+    for bucket in ("benchmarks", "body_metrics"):
+        for item in (extracted.get(bucket) or []):
+            name = (item.get("name") or "").strip()
+            date = (item.get("date") or "").strip()
+            value = item.get("value")
+            if not name or value in (None, ""):
+                continue
+            series = data[bucket].setdefault(name, [])
+            if any(p.get("date") == date and str(p.get("value")) == str(value) for p in series):
+                continue
+            point = {"date": date, "value": value}
+            if item.get("note"):
+                point["note"] = item["note"]
+            series.append(point)
+            series.sort(key=lambda p: p.get("date") or "")
+            added += 1
+    for inj in (extracted.get("blessures") or []):
+        zone = (inj.get("zone") or "").strip()
+        date = (inj.get("date") or "").strip()
+        if not zone:
+            continue
+        existing_inj = next((b for b in data["blessures"] if b.get("zone") == zone and b.get("date") == date), None)
+        if existing_inj:
+            if inj.get("statut"):
+                existing_inj["statut"] = inj["statut"]
+            continue
+        data["blessures"].append({k: inj.get(k) for k in ("date", "zone", "note", "statut") if inj.get(k)})
+        added += 1
+    return data, added
+
+
+def extract_structured_data(user_number: str, history: list[dict]) -> dict:
+    """Extrait les données chiffrées (PR, temps, charges, poids, blessures) via le LLM. Ne lève jamais."""
+    if not history:
+        return {}
+    messages_text = "\n".join(
+        f"{'Louis' if m['role'] == 'user' else 'Willy'}: {m['content']}"
+        for m in history
+    )
+    today = datetime.now(pytz.timezone("Europe/Paris")).strftime("%Y-%m-%d")
+    prompt = (
+        "Extrais UNIQUEMENT les données chiffrées objectives mentionnées par Louis dans ces échanges "
+        "(records/PR, temps de séance, charges soulevées, poids de corps, blessures).\n"
+        f"Date du jour : {today}. Si une donnée n'a pas de date explicite mais semble récente, utilise la date du jour. "
+        "Ignore toute donnée trop vague (sans valeur chiffrée claire).\n\n"
+        "Réponds STRICTEMENT en JSON valide, rien d'autre, avec ce schéma :\n"
+        "{\n"
+        '  "benchmarks": [{"name": "row_1000m", "date": "YYYY-MM-DD", "value": "3:34", "note": ""}],\n'
+        '  "body_metrics": [{"name": "poids", "date": "YYYY-MM-DD", "value": "78.5"}],\n'
+        '  "blessures": [{"date": "YYYY-MM-DD", "zone": "epaule droite", "note": "...", "statut": "en cours"}]\n'
+        "}\n"
+        "Utilise des noms de benchmarks normalisés et stables (ex: row_1000m, back_squat_1rm, run_5k, fran, pull_ups_max, wallballs_max). "
+        'Si rien à extraire, renvoie {"benchmarks": [], "body_metrics": [], "blessures": []}.\n\n'
+        f"ÉCHANGES :\n{messages_text}"
+    )
+    try:
+        response = get_anthropic_client().messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=800,
+            system="Tu es un extracteur de données sportives. Tu réponds uniquement en JSON valide.",
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = response.content[0].text.strip()
+        start, end = raw.find("{"), raw.rfind("}")
+        if start == -1 or end == -1:
+            return {}
+        return json.loads(raw[start:end + 1])
+    except Exception as e:
+        print(f"[extract] erreur extraction structurée pour {user_number}: {e}")
+        return {}
+
+
+def update_athlete_data(user_number: str, history: list[dict]) -> int:
+    """Extrait + fusionne (additif) les données structurées. Backup avant écriture. Ne lève jamais."""
+    try:
+        extracted = extract_structured_data(user_number, history)
+        if not extracted:
+            return 0
+        existing = athlete_data.get(user_number) or _empty_athlete_data()
+        merged, added = merge_structured_data(existing, extracted)
+        if added > 0:
+            backup_athlete_data(user_number)
+            athlete_data[user_number] = merged
+            persist_set("athlete_data", athlete_data)
+            print(f"[struct] {user_number}: +{added} point(s) de données structurées")
+        return added
+    except Exception as e:
+        print(f"[struct] erreur update_athlete_data pour {user_number}: {e}")
+        return 0
+
+
+def format_athlete_data(user_number: str) -> str:
+    """Formate les données structurées en bloc lisible pour injection dans le prompt."""
+    data = athlete_data.get(user_number)
+    if not data:
+        return ""
+    lines = []
+    benchmarks = data.get("benchmarks") or {}
+    if benchmarks:
+        lines.append("Benchmarks / PR (chronologique — calcule les deltas toi-même) :")
+        for name, series in benchmarks.items():
+            pts = ", ".join(f"{p['date']}: {p['value']}" for p in series)
+            lines.append(f"- {name} → {pts}")
+    metrics = data.get("body_metrics") or {}
+    if metrics:
+        lines.append("Mesures corporelles :")
+        for name, series in metrics.items():
+            pts = ", ".join(f"{p['date']}: {p['value']}" for p in series)
+            lines.append(f"- {name} → {pts}")
+    blessures = data.get("blessures") or []
+    if blessures:
+        lines.append("Blessures / points de vigilance :")
+        for b in blessures:
+            lines.append(
+                f"- {b.get('date', '?')} {b.get('zone', '')} ({b.get('statut', '?')}) {b.get('note', '')}".rstrip()
+            )
+    return "\n".join(lines)
 
 
 def save_strava_tokens(tokens: dict):
@@ -413,6 +566,11 @@ def _get_ai_response_locked(user_number: str, user_message: str) -> str:
             print(f"[compress] OK pour {user_number} — {len(old_summary)} → {len(new_summary)} chars, ancien backup'd")
         else:
             print(f"[compress] REJETÉ pour {user_number} — {reason}. Ancien résumé conservé ({len(old_summary)} chars)")
+        # Mémoire structurée : extraction additive des benchmarks/métriques/blessures
+        # (jamais bloquant — update_athlete_data n'élève jamais d'exception)
+        n_struct = update_athlete_data(user_number, history)
+        if n_struct:
+            print(f"[struct] {n_struct} nouveau(x) point(s) de données pour {user_number}")
         history = history[-10:]
         conversation_histories[user_number] = history
 
@@ -456,6 +614,10 @@ def _get_ai_response_locked(user_number: str, user_message: str) -> str:
     system = SYSTEM_PROMPT + date_context
     if user_number in athlete_summaries:
         system += f"\n\n📋 Mémoire de tes échanges précédents avec Louis :\n{athlete_summaries[user_number]}"
+
+    struct_block = format_athlete_data(user_number)
+    if struct_block:
+        system += f"\n\n{struct_block}"
 
     if strava_data:
         system += f"\n\n{strava_data}\n\nUtilise ces données pour personnaliser tes conseils si pertinent."
@@ -647,6 +809,8 @@ def admin_memory():
                 {"timestamp": b["timestamp"], "length": len(b["summary"])}
                 for b in backups
             ],
+            "athlete_data": athlete_data.get(user, {}),
+            "athlete_data_formatted": format_athlete_data(user),
         }, 200
 
     if action == "list_backups":
@@ -740,10 +904,11 @@ def admin_restore_all():
         from db import db_restore_all
         count = db_restore_all(dump)
         # Recharge l'état en mémoire après restauration
-        global strava_tokens, conversation_histories, athlete_summaries
+        global strava_tokens, conversation_histories, athlete_summaries, athlete_data
         strava_tokens = persist_get("strava_tokens", {})
         conversation_histories = persist_get("conversation_histories", {})
         athlete_summaries = persist_get("athlete_summaries", {})
+        athlete_data = persist_get("athlete_data", {})
         return {"status": "ok", "keys_restored": count}, 200
     except Exception as e:
         return {"status": "error", "error": str(e)}, 500
@@ -850,9 +1015,39 @@ def weekly_summary():
         send_whatsapp(user_number, f"📊 Bilan de la semaine :\n\n{bilan}")
 
 
+def daily_consolidation():
+    """
+    Passe quotidienne d'extraction de la mémoire structurée.
+    Complète l'extraction faite à la compression (toutes les 20 messages) :
+    garantit une mise à jour des benchmarks/métriques même les semaines calmes
+    où on n'atteint pas le seuil de compression.
+
+    CRITIQUE : prend le lock par user (comme _get_ai_response_locked) pour éviter
+    toute race condition avec un message entrant pendant la consolidation.
+    """
+    print("[struct] début consolidation quotidienne")
+    total = 0
+    for user_number in list(conversation_histories.keys()):
+        history = conversation_histories.get(user_number) or []
+        if not history:
+            continue
+        lock = get_user_lock(user_number)
+        with lock:
+            try:
+                n = update_athlete_data(user_number, conversation_histories.get(user_number) or [])
+                if n:
+                    total += n
+                    print(f"[struct] consolidation : {n} point(s) pour {user_number}")
+            except Exception as e:
+                print(f"[struct] consolidation erreur pour {user_number}: {e}")
+    print(f"[struct] consolidation quotidienne terminée — {total} point(s) au total")
+
+
 # Scheduler — bilan automatique chaque dimanche à 18h heure de Paris
 scheduler = BackgroundScheduler(timezone=pytz.timezone("Europe/Paris"))
 scheduler.add_job(weekly_summary, "cron", day_of_week="sun", hour=18, minute=0)
+# Consolidation mémoire structurée chaque jour à 2h (Paris), avant le backup externe (3h UTC = 4-5h Paris)
+scheduler.add_job(daily_consolidation, "cron", hour=2, minute=0)
 scheduler.start()
 
 
