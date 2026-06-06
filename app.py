@@ -73,6 +73,13 @@ athlete_summaries: dict = persist_get("athlete_summaries", {})
 #                   "body_metrics": {nom: [{date, value}]},
 #                   "blessures": [{date, zone, note, statut}]}
 athlete_data: dict = persist_get("athlete_data", {})
+# Mémoire PLAN (programmation logique = périodisation + semaine prévue + suivi prévu/réalisé).
+# Forme par user :
+# {"phases": [{nom, debut, fin, focus, cible}],          # macro 6 mois (squelette validé)
+#  "semaine_courante": {debut, fin, phase, objectif,     # micro : semaine planifiée
+#                       seances: [{jour, date, type, detail, rationale}]},
+#  "historique": [{debut, phase, prevu_resume, realise_resume, adherence}]}  # méso : archive
+training_plan: dict = persist_get("training_plan", {})
 last_strava_fetch: dict[str, datetime] = {}
 strava_cache: dict[str, str] = {}
 
@@ -285,6 +292,152 @@ def format_athlete_data(user_number: str) -> str:
                 f"- {b.get('date', '?')} {b.get('zone', '')} ({b.get('statut', '?')}) {b.get('note', '')}".rstrip()
             )
     return "\n".join(lines)
+
+
+# ════════════════════════════════════════════════════════════════════
+# MÉMOIRE PLAN (programmation logique : périodisation + semaine + suivi)
+# ════════════════════════════════════════════════════════════════════
+
+def _empty_training_plan() -> dict:
+    return {"phases": [], "semaine_courante": {}, "historique": []}
+
+
+def backup_training_plan(user_number: str):
+    """Snapshot du plan avant modification (rollback possible). Garde 10 snapshots."""
+    current = training_plan.get(user_number)
+    if not current:
+        return
+    key = f"training_plan_history__{user_number}"
+    snapshots = persist_get(key, []) or []
+    snapshots.append({"timestamp": datetime.now().isoformat(), "plan": current})
+    snapshots = snapshots[-10:]
+    persist_set(key, snapshots)
+
+
+def get_current_phase(user_number: str, ref_date: str = None) -> dict:
+    """Retourne la phase macro dont l'intervalle [debut, fin] contient ref_date (défaut: aujourd'hui)."""
+    plan = training_plan.get(user_number) or {}
+    phases = plan.get("phases") or []
+    if not phases:
+        return {}
+    if ref_date is None:
+        ref_date = datetime.now(pytz.timezone("Europe/Paris")).strftime("%Y-%m-%d")
+    for ph in phases:
+        if (ph.get("debut") or "") <= ref_date <= (ph.get("fin") or "9999"):
+            return ph
+    return {}
+
+
+def get_next_phase(user_number: str, ref_date: str = None) -> dict:
+    """Retourne la première phase dont le début est strictement après ref_date."""
+    plan = training_plan.get(user_number) or {}
+    phases = plan.get("phases") or []
+    if ref_date is None:
+        ref_date = datetime.now(pytz.timezone("Europe/Paris")).strftime("%Y-%m-%d")
+    futures = [ph for ph in phases if (ph.get("debut") or "") > ref_date]
+    return min(futures, key=lambda p: p.get("debut") or "", default={})
+
+
+def set_week_plan(user_number: str, week: dict, adherence: str = "", realise_resume: str = "") -> bool:
+    """
+    Archive la semaine courante dans l'historique (avec prévu/réalisé/adhérence) puis installe
+    la nouvelle. Backup avant écriture. ADDITIF sur l'historique. Ne lève jamais.
+    """
+    try:
+        plan = training_plan.get(user_number) or _empty_training_plan()
+        plan.setdefault("phases", [])
+        plan.setdefault("semaine_courante", {})
+        plan.setdefault("historique", [])
+        backup_training_plan(user_number)
+        old = plan.get("semaine_courante") or {}
+        if old:
+            seances = old.get("seances") or []
+            prevu = "; ".join(
+                f"{s.get('jour', '?')}: {s.get('type', '')} {s.get('detail', '')}".strip()
+                for s in seances
+            )
+            plan["historique"].append({
+                "debut": old.get("debut", ""),
+                "phase": old.get("phase", ""),
+                "prevu_resume": prevu[:1000],
+                "realise_resume": (realise_resume or "")[:1000],
+                "adherence": adherence,
+            })
+            plan["historique"] = plan["historique"][-26:]  # ~6 mois d'archives
+        plan["semaine_courante"] = week
+        training_plan[user_number] = plan
+        persist_set("training_plan", training_plan)
+        return True
+    except Exception as e:
+        print(f"[plan] erreur set_week_plan pour {user_number}: {e}")
+        return False
+
+
+def format_training_plan(user_number: str) -> str:
+    """Bloc lisible (phase courante + cible + semaine prévue) injecté dans le prompt."""
+    plan = training_plan.get(user_number)
+    if not plan or not plan.get("phases"):
+        return ""
+    lines = ["═══ PLAN D'ENTRAÎNEMENT (programmation) ═══"]
+    phase = get_current_phase(user_number)
+    if phase:
+        lines.append(f"Phase actuelle : {phase.get('nom', '?')} ({phase.get('debut', '')} → {phase.get('fin', '')})")
+        if phase.get("focus"):
+            lines.append(f"  Focus : {phase['focus']}")
+        if phase.get("cible"):
+            lines.append(f"  🎯 Cible de phase : {phase['cible']}")
+    nxt = get_next_phase(user_number)
+    if nxt:
+        lines.append(f"Phase suivante : {nxt.get('nom', '?')} (à partir du {nxt.get('debut', '')})")
+    week = plan.get("semaine_courante") or {}
+    seances = week.get("seances") or []
+    if seances:
+        lines.append(f"Semaine en cours PRÉVUE ({week.get('debut', '')} → {week.get('fin', '')}) :")
+        if week.get("objectif"):
+            lines.append(f"  Objectif semaine : {week['objectif']}")
+        for s in seances:
+            detail = f"{s.get('type', '')} — {s.get('detail', '')}".strip(" —")
+            lines.append(f"  - {s.get('jour', '?')} {s.get('date', '')}: {detail}")
+    lines.append("Rappel : la force est un pilier PERMANENT de la prépa (ne jamais l'abandonner).")
+    lines.append("Programme et conseille en cohérence avec la phase et la semaine prévue ci-dessus.")
+    return "\n".join(lines)
+
+
+def extract_week_plan(user_number: str, bilan_text: str, week_start: str, week_end: str, phase_nom: str) -> dict:
+    """
+    2e appel LLM : transforme la section 'PROGRAMME S+1' du bilan en plan structuré JSON.
+    Ne lève jamais — si échec, retourne {} (le plan ne sera pas stocké mais le bilan part quand même).
+    """
+    try:
+        prompt = (
+            "Voici un bilan d'entraînement hebdomadaire rédigé par un coach. Il contient une section "
+            "'PROGRAMME S+1' avec les 7 prochains jours. Extrais UNIQUEMENT ce programme de la semaine "
+            "à venir en JSON valide strict, rien d'autre, avec ce schéma :\n"
+            "{\n"
+            f'  "debut": "{week_start}", "fin": "{week_end}", "phase": "{phase_nom}",\n'
+            '  "objectif": "objectif global de la semaine en 1 phrase",\n'
+            '  "seances": [\n'
+            '    {"jour": "lundi", "date": "YYYY-MM-DD", "type": "repos|Z2|seuil|fractionné|force|WOD Hyrox|sortie longue",\n'
+            '     "detail": "durée, allure, zone, format, mouvements", "rationale": "pourquoi cette séance"}\n'
+            "  ]\n"
+            "}\n"
+            "Mets les 7 jours (lundi→dimanche). Si un jour est repos, type='repos'.\n\n"
+            f"BILAN :\n{bilan_text}"
+        )
+        response = get_anthropic_client().messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=1200,
+            system="Tu es un extracteur de plan d'entraînement. Tu réponds uniquement en JSON valide.",
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = response.content[0].text.strip()
+        start, end = raw.find("{"), raw.rfind("}")
+        if start == -1 or end == -1:
+            return {}
+        return json.loads(raw[start:end + 1])
+    except Exception as e:
+        print(f"[plan] erreur extract_week_plan pour {user_number}: {e}")
+        return {}
 
 
 def save_strava_tokens(tokens: dict):
@@ -619,6 +772,10 @@ def _get_ai_response_locked(user_number: str, user_message: str) -> str:
     if struct_block:
         system += f"\n\n{struct_block}"
 
+    plan_block = format_training_plan(user_number)
+    if plan_block:
+        system += f"\n\n{plan_block}"
+
     if strava_data:
         system += f"\n\n{strava_data}\n\nUtilise ces données pour personnaliser tes conseils si pertinent."
         if is_new_session:
@@ -811,6 +968,8 @@ def admin_memory():
             ],
             "athlete_data": athlete_data.get(user, {}),
             "athlete_data_formatted": format_athlete_data(user),
+            "training_plan": training_plan.get(user, {}),
+            "training_plan_formatted": format_training_plan(user),
         }, 200
 
     if action == "list_backups":
@@ -859,7 +1018,22 @@ def admin_memory():
             "old_length": len(old_summary),
         }, 200
 
-    return {"status": "unknown action", "valid_actions": ["dump", "list_backups", "restore", "restore_from_backup"]}, 400
+    if action == "run_weekly":
+        # Déclenche le bilan hebdo (+ génération/stockage du plan S+1) à la demande, pour CE user.
+        # Envoie un vrai message WhatsApp au user. Utilisé pour tester / semer la 1re semaine.
+        try:
+            weekly_summary(only_user=user)
+            week = (training_plan.get(user) or {}).get("semaine_courante") or {}
+            return {
+                "status": "ok",
+                "ran_for": user,
+                "semaine_stockee": bool(week.get("seances")),
+                "nb_seances": len(week.get("seances") or []),
+            }, 200
+        except Exception as e:
+            return {"status": "error", "error": str(e)}, 500
+
+    return {"status": "unknown action", "valid_actions": ["dump", "list_backups", "restore", "restore_from_backup", "run_weekly"]}, 400
 
 
 @app.route("/admin/backup", methods=["POST"])
@@ -904,11 +1078,12 @@ def admin_restore_all():
         from db import db_restore_all
         count = db_restore_all(dump)
         # Recharge l'état en mémoire après restauration
-        global strava_tokens, conversation_histories, athlete_summaries, athlete_data
+        global strava_tokens, conversation_histories, athlete_summaries, athlete_data, training_plan
         strava_tokens = persist_get("strava_tokens", {})
         conversation_histories = persist_get("conversation_histories", {})
         athlete_summaries = persist_get("athlete_summaries", {})
         athlete_data = persist_get("athlete_data", {})
+        training_plan = persist_get("training_plan", {})
         return {"status": "ok", "keys_restored": count}, 200
     except Exception as e:
         return {"status": "error", "error": str(e)}, 500
@@ -959,7 +1134,7 @@ def send_whatsapp(to: str, message: str):
             print(f"[twilio] erreur d'envoi à {to}: {type(e).__name__}: {e}")
 
 
-def weekly_summary():
+def weekly_summary(only_user: str = None):
     paris = pytz.timezone("Europe/Paris")
     today = datetime.now(paris)
     week_ago = int((today.timestamp()) - 7 * 86400)
@@ -970,40 +1145,75 @@ def weekly_summary():
     sem_barcelone = j_barcelone // 7
     sem_milan = j_milan // 7
 
+    # S+1 = semaine à venir (lundi → dimanche), le bilan tombe le dimanche soir
+    next_monday = today + timedelta(days=1)
+    week_start = next_monday.strftime("%Y-%m-%d")
+    week_end = (next_monday + timedelta(days=6)).strftime("%Y-%m-%d")
+
     for user_number, token_data in strava_tokens.items():
+        if only_user and user_number != only_user:
+            continue
         strava_data = get_strava_activities(user_number, limit=10, after=week_ago)
         if not strava_data:
             continue
         summary = athlete_summaries.get(user_number, "")
+
+        # PLAN : phase de la semaine à venir + ce qui était PRÉVU la semaine écoulée
+        phase = get_current_phase(user_number, week_start) or get_current_phase(user_number)
+        prevu = (training_plan.get(user_number) or {}).get("semaine_courante") or {}
+        phase_block = ""
+        if phase:
+            phase_block = (
+                f"\n\n═══ PHASE DE PÉRIODISATION EN COURS ═══\n"
+                f"Phase : {phase.get('nom', '?')} ({phase.get('debut', '')} → {phase.get('fin', '')})\n"
+                f"Focus de la phase : {phase.get('focus', '')}\n"
+                f"🎯 Cible de la phase : {phase.get('cible', '')}\n"
+                f"RÈGLE PERMANENTE : la force est un pilier de toute la prépa, ne jamais l'abandonner.\n"
+                f"Le PROGRAMME S+1 que tu vas pondre DOIT s'inscrire dans cette phase et viser sa cible."
+            )
+        prevu_block = ""
+        if prevu and prevu.get("seances"):
+            lignes = "\n".join(
+                f"- {s.get('jour', '?')}: {s.get('type', '')} — {s.get('detail', '')}".rstrip(" —")
+                for s in prevu["seances"]
+            )
+            prevu_block = (
+                f"\n\n═══ CE QUI ÉTAIT PRÉVU CETTE SEMAINE (à confronter au réalisé Strava) ═══\n"
+                f"{lignes}\n"
+                f"Dans l'analyse quantitative, dis explicitement le taux de SUIVI du plan (prévu vs réalisé) "
+                f"et tire-en les conséquences pour S+1."
+            )
+
         prompt = (
             f"Tu es Willy Georges, coach Hyrox professionnel. Tu fais le bilan hebdomadaire de Louis.\n\n"
             f"Objectifs : Barcelone Hyrox (~15 nov 2026, J-{j_barcelone}, ~{sem_barcelone} semaines) "
-            f"| Milan Sub-60 (~13 déc 2026, J-{j_milan}, ~{sem_milan} semaines).\n\n"
-            f"═══ DONNÉES STRAVA DE LA SEMAINE ÉCOULÉE ═══\n{strava_data}\n\n"
+            f"| Milan Sub-60 (~13 déc 2026, J-{j_milan}, ~{sem_milan} semaines).{phase_block}{prevu_block}\n\n"
+            f"═══ DONNÉES STRAVA DE LA SEMAINE ÉCOULÉE (= le réalisé) ═══\n{strava_data}\n\n"
             f"═══ MÉMOIRE PROFIL LOUIS ═══\n{summary}\n\n"
-            f"═══ DATE DU BILAN ═══\n{today.strftime('%A %d %B %Y')}\n\n"
+            f"═══ DATE DU BILAN ═══\n{today.strftime('%A %d %B %Y')}\n"
+            f"La semaine S+1 va du {week_start} (lundi) au {week_end} (dimanche).\n\n"
             f"═══ STRUCTURE OBLIGATOIRE DU BILAN ═══\n"
             f"Sois dense, technique et précis (pas concis). Aucune section ne doit être vide ou expédiée. "
             f"C'est le moment où tu apportes le plus de valeur à Louis vers son Sub-60.\n\n"
             f"📊 ANALYSE QUANTITATIVE\n"
             f"- Volume total de la semaine (km, heures, nb séances)\n"
             f"- Distribution Z2 / Z3 / Z4 / Force / WOD / Repos\n"
-            f"- Jours OFF (et si c'était justifié vu la charge)\n"
+            f"- SUIVI DU PLAN : prévu vs réalisé, ce qui a sauté, ce qui a été ajouté\n"
             f"- Comparaison vs semaine précédente si possible\n\n"
             f"🧠 ANALYSE QUALITATIVE\n"
             f"- Progrès observés concrets (FC qui descend à allure égale, allures qui s'améliorent, sensations rapportées)\n"
             f"- Ce qui stagne ou inquiète (zone non travaillée, séance manquée, signaux faibles)\n"
             f"- Signaux de surcharge ou sous-charge\n"
-            f"- Où Louis a une marge de progression que tu veux attaquer\n\n"
-            f"🎯 PROGRAMME S+1 (jour par jour, avec POURQUOI chaque séance)\n"
-            f"Détaille les 7 prochains jours en partant de demain. Pour chaque jour :\n"
+            f"- Où en est Louis vs la CIBLE de la phase actuelle\n\n"
+            f"🎯 PROGRAMME S+1 (jour par jour, du lundi {week_start} au dimanche {week_end}, avec POURQUOI chaque séance)\n"
+            f"Détaille les 7 jours. Pour chaque jour :\n"
             f"- Le jour de la semaine + date\n"
             f"- La séance précise (durée, zone, allure, format, mouvements)\n"
-            f"- Le rationale en 1 phrase (pourquoi cette séance MAINTENANT compte tenu de la charge de la semaine écoulée)\n\n"
+            f"- Le rationale en 1 phrase (pourquoi cette séance MAINTENANT, vu la phase et la charge écoulée)\n"
+            f"Inclus IMPÉRATIVEMENT au moins une séance de force (pilier permanent).\n\n"
             f"🔭 VISION S+2 et S+4\n"
             f"- S+2 : intentions globales et ajustements possibles selon l'adaptation de S+1\n"
-            f"- S+4 : positionnement dans le cycle (combien de semaines avant Barcelone/Milan, "
-            f"phase actuelle : Fondations / Intensification / Spécifique / Taper, et ce qu'on devrait avoir progressé d'ici là)\n\n"
+            f"- S+4 : positionnement dans le cycle (phase, semaines avant Barcelone/Milan, ce qu'on devrait avoir progressé)\n\n"
             f"Ton : direct, technique, motivant. Tutoiement. Pas de flatterie creuse. Tu peux dire 'ma gueule' une fois si c'est sincère."
         )
         response = get_anthropic_client().messages.create(
@@ -1013,6 +1223,18 @@ def weekly_summary():
         )
         bilan = response.content[0].text
         send_whatsapp(user_number, f"📊 Bilan de la semaine :\n\n{bilan}")
+
+        # MÉMOIRE PLAN : extraire la semaine S+1 du bilan et la stocker (archive prévu/réalisé).
+        # Sous lock per-user (cohérence avec les messages entrants). Ne bloque jamais l'envoi du bilan.
+        try:
+            phase_nom = phase.get("nom", "") if phase else ""
+            week = extract_week_plan(user_number, bilan, week_start, week_end, phase_nom)
+            if week and week.get("seances"):
+                with get_user_lock(user_number):
+                    set_week_plan(user_number, week, realise_resume=strava_data[:1000])
+                print(f"[plan] semaine S+1 stockée pour {user_number} ({len(week['seances'])} séances)")
+        except Exception as e:
+            print(f"[plan] erreur stockage S+1 pour {user_number}: {e}")
 
 
 def daily_consolidation():
