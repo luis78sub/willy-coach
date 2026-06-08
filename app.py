@@ -80,6 +80,11 @@ athlete_data: dict = persist_get("athlete_data", {})
 #                       seances: [{jour, date, type, detail, rationale}]},
 #  "historique": [{debut, phase, prevu_resume, realise_resume, adherence}]}  # méso : archive
 training_plan: dict = persist_get("training_plan", {})
+# Mémoire RÉALISÉ (séances que Louis DÉCLARE avoir faites, loguées au fil de l'eau).
+# = source de vérité du "réalisé" pour le bilan (Strava ne couvre pas la muscu/CrossFit/WOD).
+# Forme par user : [{date, jour, moment, type, detail, donnees, source}]  (liste plate, triée par date)
+# moment (matin/midi/soir) distingue 2 séances du même type le même jour (doubles/triples).
+realise: dict = persist_get("realise", {})
 last_strava_fetch: dict[str, datetime] = {}
 strava_cache: dict[str, str] = {}
 
@@ -147,6 +152,23 @@ def backup_summary(user_number: str):
     persist_set(key, snapshots)
 
 
+def _is_future_date(date_str: str, today_str: str) -> bool:
+    """
+    True si date_str (YYYY-MM-DD) est STRICTEMENT après today_str.
+    Tolérant : parsing réel des dates (évite les pièges de comparaison texte sur
+    des dates non zero-paddées). Si date_str est vide ou non parseable → False
+    (on préfère NE PAS rejeter une donnée plutôt que de jeter du réalisé valide).
+    """
+    if not date_str:
+        return False
+    try:
+        d = datetime.strptime(date_str.strip(), "%Y-%m-%d").date()
+        t = datetime.strptime(today_str, "%Y-%m-%d").date()
+        return d > t
+    except Exception:
+        return False
+
+
 def _empty_athlete_data() -> dict:
     return {"benchmarks": {}, "body_metrics": {}, "blessures": []}
 
@@ -175,6 +197,9 @@ def merge_structured_data(existing: dict, extracted: dict) -> tuple[dict, int]:
     data.setdefault("body_metrics", {})
     data.setdefault("blessures", [])
     added = 0
+    # Filet de sécurité : on n'enregistre JAMAIS une perf datée dans le futur
+    # (= une cible/un prévu qui aurait échappé au prompt). Le carnet = uniquement le réalisé.
+    today_str = datetime.now(pytz.timezone("Europe/Paris")).strftime("%Y-%m-%d")
     for bucket in ("benchmarks", "body_metrics"):
         for item in (extracted.get(bucket) or []):
             name = (item.get("name") or "").strip()
@@ -182,6 +207,8 @@ def merge_structured_data(existing: dict, extracted: dict) -> tuple[dict, int]:
             value = item.get("value")
             if not name or value in (None, ""):
                 continue
+            if _is_future_date(date, today_str):
+                continue  # date future → cible/prévu, on rejette
             series = data[bucket].setdefault(name, [])
             if any(p.get("date") == date and str(p.get("value")) == str(value) for p in series):
                 continue
@@ -215,18 +242,35 @@ def extract_structured_data(user_number: str, history: list[dict]) -> dict:
         for m in history
     )
     today = datetime.now(pytz.timezone("Europe/Paris")).strftime("%Y-%m-%d")
+    # On fournit au LLM les clés de benchmarks DÉJÀ utilisées pour qu'il les réutilise
+    # au lieu d'en inventer une variante à chaque fois (back_squat / back_squat_work / back_squat_5x4...).
+    existing = athlete_data.get(user_number) or {}
+    existing_keys = sorted((existing.get("benchmarks") or {}).keys())
+    keys_block = (
+        "CLÉS DÉJÀ EXISTANTES (réutilise-les TELLES QUELLES si la donnée correspond, n'en invente pas de variante) :\n"
+        + ", ".join(existing_keys) + "\n\n"
+    ) if existing_keys else ""
     prompt = (
-        "Extrais UNIQUEMENT les données chiffrées objectives mentionnées par Louis dans ces échanges "
-        "(records/PR, temps de séance, charges soulevées, poids de corps, blessures).\n"
-        f"Date du jour : {today}. Si une donnée n'a pas de date explicite mais semble récente, utilise la date du jour. "
+        "Extrais UNIQUEMENT les données chiffrées que Louis déclare avoir RÉELLEMENT réalisées dans ces échanges "
+        "(records/PR, temps de séance, charges soulevées, poids de corps, blessures).\n\n"
+        "🚫 INTERDIT ABSOLU : n'extrais JAMAIS un objectif, une cible, une charge 'prévue', une séance future, "
+        "un programme à venir, ou quoi que ce soit que Louis n'a pas ENCORE fait. "
+        "Seul le réalisé compte. En cas de doute (prévu ou réalisé ?), n'extrais PAS.\n\n"
+        f"Date du jour : {today}. N'utilise JAMAIS une date dans le futur. "
+        "Si une donnée réalisée n'a pas de date explicite mais semble récente, utilise la date du jour. "
         "Ignore toute donnée trop vague (sans valeur chiffrée claire).\n\n"
+        + keys_block +
         "Réponds STRICTEMENT en JSON valide, rien d'autre, avec ce schéma :\n"
         "{\n"
         '  "benchmarks": [{"name": "row_1000m", "date": "YYYY-MM-DD", "value": "3:34", "note": ""}],\n'
         '  "body_metrics": [{"name": "poids", "date": "YYYY-MM-DD", "value": "78.5"}],\n'
         '  "blessures": [{"date": "YYYY-MM-DD", "zone": "epaule droite", "note": "...", "statut": "en cours"}]\n'
         "}\n"
-        "Utilise des noms de benchmarks normalisés et stables (ex: row_1000m, back_squat_1rm, run_5k, fran, pull_ups_max, wallballs_max). "
+        "Règles de nommage des clés benchmarks (stables, en snake_case) :\n"
+        "- un 1RM testé → suffixe _1rm (ex: back_squat_1rm, bench_press_1rm). NE PAS créer back_squat ET back_squat_1rm pour la même chose.\n"
+        "- une perf de course → run_<distance> (ex: run_8km, run_12km) ; allure Z2 de référence → run_z2_pace.\n"
+        "- un WOD/benchmark nommé → son nom (murph, fran...). Mets toujours la valeur AVEC son unité (kg, km, min).\n"
+        "- réutilise une clé existante listée ci-dessus plutôt que d'en créer une proche.\n"
         'Si rien à extraire, renvoie {"benchmarks": [], "body_metrics": [], "blessures": []}.\n\n'
         f"ÉCHANGES :\n{messages_text}"
     )
@@ -291,6 +335,155 @@ def format_athlete_data(user_number: str) -> str:
             lines.append(
                 f"- {b.get('date', '?')} {b.get('zone', '')} ({b.get('statut', '?')}) {b.get('note', '')}".rstrip()
             )
+    return "\n".join(lines)
+
+
+# ════════════════════════════════════════════════════════════════════
+# MÉMOIRE RÉALISÉ (séances déclarées par Louis, loguées au fil de l'eau)
+# = source de vérité du bilan pour éviter que Willy "devine" la semaine
+# ════════════════════════════════════════════════════════════════════
+
+def backup_realise(user_number: str):
+    """Snapshot du réalisé avant fusion (rollback possible). Garde 10 snapshots."""
+    current = realise.get(user_number)
+    if not current:
+        return
+    key = f"realise_history__{user_number}"
+    snapshots = persist_get(key, []) or []
+    snapshots.append({"timestamp": datetime.now().isoformat(), "sessions": current})
+    snapshots = snapshots[-10:]
+    persist_set(key, snapshots)
+
+
+def extract_realized_sessions(user_number: str, history: list) -> list:
+    """
+    Extrait les séances que Louis DÉCLARE avoir réellement faites (jamais le prévu).
+    Retourne une liste de séances. Ne lève jamais (retourne [] en cas d'échec).
+    """
+    if not history:
+        return []
+    messages_text = "\n".join(
+        f"{'Louis' if m['role'] == 'user' else 'Willy'}: {m['content']}"
+        for m in history
+    )
+    today = datetime.now(pytz.timezone("Europe/Paris")).strftime("%Y-%m-%d")
+    prompt = (
+        "Tu lis une conversation entre Louis (athlète) et son coach. Extrais UNIQUEMENT les séances "
+        "que LOUIS DÉCLARE EXPLICITEMENT avoir RÉELLEMENT faites (passées, terminées).\n\n"
+        "🚫 N'extrais JAMAIS : une séance prévue/à venir, un programme, une recommandation du coach, "
+        "une intention ('je vais faire'), une séance dont tu n'es pas sûr qu'elle a eu lieu. "
+        "En cas de doute → ne l'extrais pas. Mieux vaut rien que d'inventer une séance.\n\n"
+        f"Date du jour : {today}. N'utilise jamais une date future. Si une séance réalisée n'a pas de date "
+        "explicite mais est clairement récente (aujourd'hui/hier), déduis la date au plus juste.\n\n"
+        "Réponds STRICTEMENT en JSON valide, rien d'autre :\n"
+        "{\n"
+        '  "sessions": [\n'
+        '    {"date": "YYYY-MM-DD", "jour": "lundi", "moment": "matin|midi|soir",\n'
+        '     "type": "Z2|seuil|fractionné|force|WOD Hyrox|CrossFit|sortie longue|natation|repos|autre",\n'
+        '     "detail": "ce qui a été fait (format, mouvements, charges)", "donnees": "km / allure / FC / temps si mentionnés"}\n'
+        "  ]\n"
+        "}\n"
+        "Le champ moment distingue deux séances du même jour (ex: double/triple journée). "
+        "Si le moment n'est pas précisé, mets une chaîne vide.\n"
+        'Si Louis ne déclare aucune séance réalisée, renvoie {"sessions": []}.\n\n'
+        f"CONVERSATION :\n{messages_text}"
+    )
+    try:
+        response = get_anthropic_client().messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=900,
+            system="Tu es un extracteur de séances d'entraînement réalisées. Tu réponds uniquement en JSON valide.",
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = response.content[0].text.strip()
+        start, end = raw.find("{"), raw.rfind("}")
+        if start == -1 or end == -1:
+            return []
+        parsed = json.loads(raw[start:end + 1])
+        return parsed.get("sessions") or []
+    except Exception as e:
+        print(f"[realise] erreur extraction pour {user_number}: {e}")
+        return []
+
+
+def merge_realise(existing: list, extracted: list) -> tuple:
+    """
+    Fusion ADDITIVE des séances réalisées. Dédup par (date, type).
+    Si une séance (date, type) existe déjà, enrichit detail/donnees si la nouvelle version est plus riche.
+    Rejette les dates futures. Retourne (liste_fusionnée triée, nb_ajoutés).
+    """
+    data = copy.deepcopy(existing) if existing else []
+    today_str = datetime.now(pytz.timezone("Europe/Paris")).strftime("%Y-%m-%d")
+    added = 0
+    for s in (extracted or []):
+        date = (s.get("date") or "").strip()
+        stype = (s.get("type") or "").strip()
+        moment = (s.get("moment") or "").strip()
+        if not date or not stype:
+            continue
+        if _is_future_date(date, today_str):
+            continue  # séance future → c'est du prévu, on rejette
+        # Dédup par (date, type, moment) → distingue deux séances du même type le même jour
+        # (double/triple journée) tout en fusionnant les ré-extractions de la même séance.
+        existing_s = next(
+            (x for x in data if x.get("date") == date and x.get("type") == stype
+             and (x.get("moment") or "") == moment),
+            None,
+        )
+        if existing_s:
+            # enrichissement : on garde le detail/donnees le plus long (= le plus informatif)
+            for field in ("detail", "donnees"):
+                new_v = (s.get(field) or "").strip()
+                if len(new_v) > len(existing_s.get(field) or ""):
+                    existing_s[field] = new_v
+            continue
+        data.append({
+            "date": date,
+            "jour": (s.get("jour") or "").strip(),
+            "moment": moment,
+            "type": stype,
+            "detail": (s.get("detail") or "").strip(),
+            "donnees": (s.get("donnees") or "").strip(),
+            "source": "declared",
+        })
+        added += 1
+    data.sort(key=lambda x: (x.get("date") or "", x.get("moment") or "", x.get("type") or ""))
+    return data, added
+
+
+def update_realise(user_number: str, history: list) -> int:
+    """Extrait + fusionne (additif) les séances réalisées. Backup avant écriture. Ne lève jamais."""
+    try:
+        extracted = extract_realized_sessions(user_number, history)
+        if not extracted:
+            return 0
+        existing = realise.get(user_number) or []
+        merged, added = merge_realise(existing, extracted)
+        if added > 0:
+            backup_realise(user_number)
+            realise[user_number] = merged[-120:]  # cap ~4 mois de séances
+            persist_set("realise", realise)
+            print(f"[realise] {user_number}: +{added} séance(s) réalisée(s)")
+        return added
+    except Exception as e:
+        print(f"[realise] erreur update_realise pour {user_number}: {e}")
+        return 0
+
+
+def format_realise(user_number: str, start_date: str, end_date: str) -> str:
+    """Bloc lisible des séances RÉALISÉES dans [start_date, end_date] (pour le bilan)."""
+    sessions = realise.get(user_number) or []
+    week = [s for s in sessions if start_date <= (s.get("date") or "") <= end_date]
+    if not week:
+        return ""
+    lines = []
+    for s in week:
+        d = f"{s.get('donnees', '')}".strip()
+        d = f" — {d}" if d else ""
+        moment = s.get("moment") or ""
+        moment = f" {moment}" if moment else ""
+        jour = f"{s.get('jour', '')}{moment}".strip()
+        lines.append(f"- {s.get('date', '')} ({jour}) {s.get('type', '')} : {s.get('detail', '')}{d}".rstrip())
     return "\n".join(lines)
 
 
@@ -724,6 +917,8 @@ def _get_ai_response_locked(user_number: str, user_message: str) -> str:
         n_struct = update_athlete_data(user_number, history)
         if n_struct:
             print(f"[struct] {n_struct} nouveau(x) point(s) de données pour {user_number}")
+        # RÉALISÉ au fil de l'eau : logue les séances déclarées par Louis (jamais bloquant)
+        update_realise(user_number, history)
         history = history[-10:]
         conversation_histories[user_number] = history
 
@@ -811,13 +1006,9 @@ def process_message_async(sender_number: str, incoming_message: str):
     """
     try:
         ai_response = get_ai_response(sender_number, incoming_message)
-        # Split à 3500 chars (WhatsApp accepte 4096, on garde une marge sécurité)
-        # → réduit massivement le nombre de segments Twilio facturés
-        if len(ai_response) > 3500:
-            for i in range(0, len(ai_response), 3500):
-                send_whatsapp(sender_number, ai_response[i:i+3500])
-        else:
-            send_whatsapp(sender_number, ai_response)
+        # Le découpage est désormais centralisé dans send_whatsapp (split intelligent
+        # ~1500 chars sur sauts de ligne) → plus aucun message tronqué.
+        send_whatsapp(sender_number, ai_response)
     except Exception as e:
         # Sur crash thread : on log mais on n'envoie PAS de message d'excuse
         # (économie de segments Twilio + tu vois que Willy n'a pas répondu, tu sais qu'il y a un souci)
@@ -970,6 +1161,8 @@ def admin_memory():
             "athlete_data_formatted": format_athlete_data(user),
             "training_plan": training_plan.get(user, {}),
             "training_plan_formatted": format_training_plan(user),
+            "realise": realise.get(user, []),
+            "realise_count": len(realise.get(user, [])),
         }, 200
 
     if action == "list_backups":
@@ -1033,7 +1226,42 @@ def admin_memory():
         except Exception as e:
             return {"status": "error", "error": str(e)}, 500
 
-    return {"status": "unknown action", "valid_actions": ["dump", "list_backups", "restore", "restore_from_backup", "run_weekly"]}, 400
+    if action == "clean_carnet":
+        # Nettoyage one-shot du carnet : supprime les entrées datées dans le FUTUR
+        # (= des cibles/prévus qui ont pollué le carnet avant le fix d'extraction).
+        cur = athlete_data.get(user)
+        if not cur:
+            return {"status": "ok", "removed": 0, "note": "carnet vide"}, 200
+        today_str = datetime.now(pytz.timezone("Europe/Paris")).strftime("%Y-%m-%d")
+        with get_user_lock(user):
+            backup_athlete_data(user)
+            removed = []
+            for bucket in ("benchmarks", "body_metrics"):
+                for name, series in list((cur.get(bucket) or {}).items()):
+                    kept = [p for p in series if not _is_future_date(p.get("date") or "", today_str)]
+                    if len(kept) != len(series):
+                        removed.append({"name": name, "dropped": len(series) - len(kept)})
+                    if kept:
+                        cur[bucket][name] = kept
+                    else:
+                        del cur[bucket][name]
+            athlete_data[user] = cur
+            persist_set("athlete_data", athlete_data)
+        return {"status": "ok", "removed": removed, "removed_total": sum(r["dropped"] for r in removed)}, 200
+
+    if action == "set_realise" and "sessions" in data:
+        # Sème / complète le réalisé d'une semaine (ex: corriger la semaine écoulée à la main).
+        # Fusion ADDITIVE (dédup par date+type), backup avant écriture.
+        with get_user_lock(user):
+            existing = realise.get(user) or []
+            merged, added = merge_realise(existing, data["sessions"])
+            if added > 0:
+                backup_realise(user)
+                realise[user] = merged[-120:]
+                persist_set("realise", realise)
+        return {"status": "ok", "added": added, "total": len(realise.get(user, []))}, 200
+
+    return {"status": "unknown action", "valid_actions": ["dump", "list_backups", "restore", "restore_from_backup", "run_weekly", "clean_carnet", "set_realise"]}, 400
 
 
 @app.route("/admin/backup", methods=["POST"])
@@ -1078,12 +1306,13 @@ def admin_restore_all():
         from db import db_restore_all
         count = db_restore_all(dump)
         # Recharge l'état en mémoire après restauration
-        global strava_tokens, conversation_histories, athlete_summaries, athlete_data, training_plan
+        global strava_tokens, conversation_histories, athlete_summaries, athlete_data, training_plan, realise
         strava_tokens = persist_get("strava_tokens", {})
         conversation_histories = persist_get("conversation_histories", {})
         athlete_summaries = persist_get("athlete_summaries", {})
         athlete_data = persist_get("athlete_data", {})
         training_plan = persist_get("training_plan", {})
+        realise = persist_get("realise", {})
         return {"status": "ok", "keys_restored": count}, 200
     except Exception as e:
         return {"status": "error", "error": str(e)}, 500
@@ -1110,13 +1339,47 @@ def reset_conversation():
     return {"status": "not_found"}, 404
 
 
+def split_message(message: str, limit: int = 1500) -> list:
+    """
+    Découpe un message long en segments <= limit caractères.
+    Casse en priorité sur un saut de ligne (puis un espace) pour ne jamais
+    couper en plein milieu d'une phrase/section. WhatsApp tronque les messages
+    trop longs → ce découpage garantit que TOUT le contenu est livré.
+    """
+    message = message or ""
+    if len(message) <= limit:
+        return [message] if message else []
+    chunks = []
+    remaining = message
+    while len(remaining) > limit:
+        window = remaining[:limit]
+        cut = window.rfind("\n")
+        if cut < limit * 0.5:  # pas de saut de ligne exploitable → tente un espace
+            cut = window.rfind(" ")
+        if cut < limit * 0.5:  # toujours rien → coupe brute
+            cut = limit
+        chunks.append(remaining[:cut].rstrip())
+        remaining = remaining[cut:].lstrip("\n ")
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
+
 def send_whatsapp(to: str, message: str):
     """
     Envoie un message WhatsApp via Twilio REST.
+    Découpe automatiquement les messages longs (WhatsApp tronque au-delà d'une
+    certaine taille — c'est ce qui coupait les bilans "au deadlift").
     Gère gracieusement l'erreur 63038 (limite quotidienne sandbox trial dépassée)
     pour ne pas crasher tout le thread async.
     """
     client = TwilioClient(os.environ["TWILIO_ACCOUNT_SID"], os.environ["TWILIO_AUTH_TOKEN"])
+    segments = split_message(message)
+    for seg in segments:
+        _send_whatsapp_segment(client, to, seg)
+
+
+def _send_whatsapp_segment(client, to: str, message: str):
     try:
         client.messages.create(
             from_="whatsapp:+14155238886",
@@ -1138,23 +1401,27 @@ def weekly_summary(only_user: str = None):
     paris = pytz.timezone("Europe/Paris")
     today = datetime.now(paris)
     week_ago = int((today.timestamp()) - 7 * 86400)
-    barcelone = datetime(2026, 11, 15, tzinfo=paris)
-    milan = datetime(2026, 12, 13, tzinfo=paris)
-    j_barcelone = (barcelone - today).days
-    j_milan = (milan - today).days
-    sem_barcelone = j_barcelone // 7
-    sem_milan = j_milan // 7
 
     # S+1 = semaine à venir (lundi → dimanche), le bilan tombe le dimanche soir
     next_monday = today + timedelta(days=1)
     week_start = next_monday.strftime("%Y-%m-%d")
     week_end = (next_monday + timedelta(days=6)).strftime("%Y-%m-%d")
+    # Semaine écoulée (= celle qu'on analyse) : lundi → dimanche (aujourd'hui)
+    reviewed_start = (today - timedelta(days=6)).strftime("%Y-%m-%d")
+    reviewed_end = today.strftime("%Y-%m-%d")
 
     for user_number, token_data in strava_tokens.items():
         if only_user and user_number != only_user:
             continue
         strava_data = get_strava_activities(user_number, limit=10, after=week_ago)
-        if not strava_data:
+        # Flush de fraîcheur : on logue les tout derniers débriefs (ex: la sortie longue
+        # du dimanche faite le jour même) AVANT de lire le réalisé, sinon le bilan la raterait.
+        with get_user_lock(user_number):
+            update_realise(user_number, conversation_histories.get(user_number) or [])
+        # RÉALISÉ déclaré par Louis = source de vérité de la semaine écoulée
+        realise_block = format_realise(user_number, reviewed_start, reviewed_end)
+        # On lance le bilan s'il y a AU MOINS une source (réalisé déclaré OU Strava)
+        if not strava_data and not realise_block:
             continue
         summary = athlete_summaries.get(user_number, "")
 
@@ -1171,6 +1438,23 @@ def weekly_summary(only_user: str = None):
                 f"RÈGLE PERMANENTE : la force est un pilier de toute la prépa, ne jamais l'abandonner.\n"
                 f"Le PROGRAMME S+1 que tu vas pondre DOIT s'inscrire dans cette phase et viser sa cible."
             )
+        # TRAJECTOIRE : position dans la phase (semaine X/Y) + phase suivante.
+        # Calculé en Python (le LLM est peu fiable sur les dates). Pas de compte à rebours.
+        nxt_phase = get_next_phase(user_number, reviewed_end)
+        traj_block = ""
+        if phase:
+            try:
+                pd = datetime.strptime(phase.get("debut", ""), "%Y-%m-%d")
+                pf = datetime.strptime(phase.get("fin", ""), "%Y-%m-%d")
+                ws = datetime.strptime(week_start, "%Y-%m-%d")
+                sem_num = max(1, (ws - pd).days // 7 + 1)
+                total = max(1, (pf - pd).days // 7 + 1)
+                traj_block = f"\nPhase {phase.get('nom', '')} : semaine {sem_num}/{total} — cible de phase : {phase.get('cible', '')}"
+                if nxt_phase:
+                    traj_block += f"\nPhase suivante : {nxt_phase.get('nom', '')} à partir du {nxt_phase.get('debut', '')}"
+            except Exception:
+                traj_block = ""
+
         prevu_block = ""
         if prevu and prevu.get("seances"):
             lignes = "\n".join(
@@ -1178,17 +1462,33 @@ def weekly_summary(only_user: str = None):
                 for s in prevu["seances"]
             )
             prevu_block = (
-                f"\n\n═══ CE QUI ÉTAIT PRÉVU CETTE SEMAINE (à confronter au réalisé Strava) ═══\n"
+                f"\n\n═══ CE QUI ÉTAIT PRÉVU CETTE SEMAINE (à confronter aux séances RÉALISÉES listées plus bas) ═══\n"
                 f"{lignes}\n"
-                f"Dans l'analyse quantitative, dis explicitement le taux de SUIVI du plan (prévu vs réalisé) "
-                f"et tire-en les conséquences pour S+1."
+                f"Dans l'analyse quantitative, compare ce prévu aux séances réellement réalisées (source de vérité), "
+                f"dis explicitement le taux de SUIVI du plan (ce qui a été fait / sauté / ajouté) et tire-en les conséquences pour S+1."
             )
 
+        realise_section = (
+            f"\n\n═══ SÉANCES RÉELLEMENT RÉALISÉES PAR LOUIS (SOURCE DE VÉRITÉ) ═══\n"
+            f"Voici les séances que Louis a DÉCLARÉES avoir faites cette semaine. C'est LA référence du réalisé.\n"
+            f"{realise_block}\n"
+            f"⚠️ RÈGLE ABSOLUE : base ton analyse du réalisé UNIQUEMENT sur cette liste. "
+            f"N'INVENTE JAMAIS une séance qui n'y figure pas (ex: ne dis pas qu'il a fait un fractionné s'il n'est pas listé). "
+            f"Si une séance prévue n'apparaît pas ici, c'est qu'elle a sauté — dis-le."
+            if realise_block else
+            f"\n\n═══ SÉANCES RÉALISÉES (déclaratif) ═══\n"
+            f"⚠️ Aucune séance déclarée n'a été loguée cette semaine. Appuie-toi sur Strava ci-dessous, "
+            f"mais reste PRUDENT : n'affirme pas une séance dont tu n'as pas la preuve, et ne déduis pas "
+            f"de séances de muscu/CrossFit/WOD à partir de Strava (Strava ne les contient pas)."
+        )
         prompt = (
             f"Tu es Willy Georges, coach Hyrox professionnel. Tu fais le bilan hebdomadaire de Louis.\n\n"
-            f"Objectifs : Barcelone Hyrox (~15 nov 2026, J-{j_barcelone}, ~{sem_barcelone} semaines) "
-            f"| Milan Sub-60 (~13 déc 2026, J-{j_milan}, ~{sem_milan} semaines).{phase_block}{prevu_block}\n\n"
-            f"═══ DONNÉES STRAVA DE LA SEMAINE ÉCOULÉE (= le réalisé) ═══\n{strava_data}\n\n"
+            f"Objectifs : Barcelone Hyrox (~15 nov 2026) | Milan Sub-60 (objectif principal, ~13 déc 2026). "
+            f"Raisonne en PHASES du cycle, pas en compte à rebours de jours.{phase_block}{prevu_block}"
+            f"{realise_section}\n\n"
+            f"═══ DONNÉES STRAVA (CROIS-CHECK cardio uniquement, PAS la source de vérité) ═══\n"
+            f"Sert-toi de Strava pour préciser allures/FC/distances des séances de course, PAS pour "
+            f"déterminer la liste des séances faites.\n{strava_data}\n\n"
             f"═══ MÉMOIRE PROFIL LOUIS ═══\n{summary}\n\n"
             f"═══ DATE DU BILAN ═══\n{today.strftime('%A %d %B %Y')}\n"
             f"La semaine S+1 va du {week_start} (lundi) au {week_end} (dimanche).\n\n"
@@ -1211,9 +1511,9 @@ def weekly_summary(only_user: str = None):
             f"- La séance précise (durée, zone, allure, format, mouvements)\n"
             f"- Le rationale en 1 phrase (pourquoi cette séance MAINTENANT, vu la phase et la charge écoulée)\n"
             f"Inclus IMPÉRATIVEMENT au moins une séance de force (pilier permanent).\n\n"
-            f"🔭 VISION S+2 et S+4\n"
-            f"- S+2 : intentions globales et ajustements possibles selon l'adaptation de S+1\n"
-            f"- S+4 : positionnement dans le cycle (phase, semaines avant Barcelone/Milan, ce qu'on devrait avoir progressé)\n\n"
+            f"🧭 TRAJECTOIRE (position dans le cycle, PAS de compte à rebours en jours){traj_block}\n"
+            f"- Situe Louis dans la phase actuelle : en avance / dans les temps / en retard vs la cible de phase (verdict franc, justifié par les chiffres)\n"
+            f"- Ce qui doit être ACQUIS avant de passer à la phase suivante, et comment le programme S+1 y contribue\n\n"
             f"Ton : direct, technique, motivant. Tutoiement. Pas de flatterie creuse. Tu peux dire 'ma gueule' une fois si c'est sincère."
         )
         response = get_anthropic_client().messages.create(
@@ -1222,7 +1522,18 @@ def weekly_summary(only_user: str = None):
             messages=[{"role": "user", "content": prompt}],
         )
         bilan = response.content[0].text
-        send_whatsapp(user_number, f"📊 Bilan de la semaine :\n\n{bilan}")
+        # Envoi en 2 messages distincts : (1) l'analyse rétro, (2) le programme S+1.
+        # → l'analyse arrive proprement même si le programme est long, et les deux
+        #   sont visuellement séparés. send_whatsapp redécoupe chaque partie si besoin.
+        marker = "🎯 PROGRAMME S+1"
+        idx = bilan.find(marker)
+        if idx > 0:
+            retro = bilan[:idx].rstrip()
+            programme = bilan[idx:].rstrip()
+            send_whatsapp(user_number, f"📊 Bilan de la semaine :\n\n{retro}")
+            send_whatsapp(user_number, programme)
+        else:
+            send_whatsapp(user_number, f"📊 Bilan de la semaine :\n\n{bilan}")
 
         # MÉMOIRE PLAN : extraire la semaine S+1 du bilan et la stocker (archive prévu/réalisé).
         # Sous lock per-user (cohérence avec les messages entrants). Ne bloque jamais l'envoi du bilan.
@@ -1231,7 +1542,7 @@ def weekly_summary(only_user: str = None):
             week = extract_week_plan(user_number, bilan, week_start, week_end, phase_nom)
             if week and week.get("seances"):
                 with get_user_lock(user_number):
-                    set_week_plan(user_number, week, realise_resume=strava_data[:1000])
+                    set_week_plan(user_number, week, realise_resume=(realise_block or strava_data)[:1000])
                 print(f"[plan] semaine S+1 stockée pour {user_number} ({len(week['seances'])} séances)")
         except Exception as e:
             print(f"[plan] erreur stockage S+1 pour {user_number}: {e}")
@@ -1260,6 +1571,8 @@ def daily_consolidation():
                 if n:
                     total += n
                     print(f"[struct] consolidation : {n} point(s) pour {user_number}")
+                # RÉALISÉ : logue aussi les séances déclarées (garantit la capture même les semaines calmes)
+                update_realise(user_number, conversation_histories.get(user_number) or [])
             except Exception as e:
                 print(f"[struct] consolidation erreur pour {user_number}: {e}")
     print(f"[struct] consolidation quotidienne terminée — {total} point(s) au total")
