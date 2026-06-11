@@ -65,6 +65,13 @@ if USE_DB:
     from db import init_db
     init_db()
 
+# FAIL-FAST au boot : si la DB est configurée mais injoignable, on CRASHE tout de suite.
+# Sinon les globales ci-dessous chargeraient vides (db_get avale les erreurs) et le premier
+# persist_set écraserait la base avec un état quasi vide.
+if USE_DB:
+    from db import db_ping
+    db_ping()  # lève si DB down → gunicorn ne démarre pas → Render redémarre/garde l'ancienne instance
+
 strava_tokens: dict = persist_get("strava_tokens", {})
 conversation_histories: dict = persist_get("conversation_histories", {})
 athlete_summaries: dict = persist_get("athlete_summaries", {})
@@ -255,7 +262,9 @@ def extract_structured_data(user_number: str, history: list[dict]) -> dict:
         "(records/PR, temps de séance, charges soulevées, poids de corps, blessures).\n\n"
         "🚫 INTERDIT ABSOLU : n'extrais JAMAIS un objectif, une cible, une charge 'prévue', une séance future, "
         "un programme à venir, ou quoi que ce soit que Louis n'a pas ENCORE fait. "
-        "Seul le réalisé compte. En cas de doute (prévu ou réalisé ?), n'extrais PAS.\n\n"
+        "Seul le réalisé compte. En cas de doute (prévu ou réalisé ?), n'extrais PAS.\n"
+        "🚫 Ce téléphone est parfois utilisé par la femme de Louis : si un message semble venir d'une autre "
+        "personne que Louis (contexte, style, contenu incohérent avec son suivi), IGNORE ses données.\n\n"
         f"Date du jour : {today}. N'utilise JAMAIS une date dans le futur. "
         "Si une donnée réalisée n'a pas de date explicite mais semble récente, utilise la date du jour. "
         "Ignore toute donnée trop vague (sans valeur chiffrée claire).\n\n"
@@ -372,7 +381,9 @@ def extract_realized_sessions(user_number: str, history: list) -> list:
         "que LOUIS DÉCLARE EXPLICITEMENT avoir RÉELLEMENT faites (passées, terminées).\n\n"
         "🚫 N'extrais JAMAIS : une séance prévue/à venir, un programme, une recommandation du coach, "
         "une intention ('je vais faire'), une séance dont tu n'es pas sûr qu'elle a eu lieu. "
-        "En cas de doute → ne l'extrais pas. Mieux vaut rien que d'inventer une séance.\n\n"
+        "En cas de doute → ne l'extrais pas. Mieux vaut rien que d'inventer une séance.\n"
+        "🚫 Ce téléphone est parfois utilisé par la femme de Louis : si un message semble venir d'une autre "
+        "personne que Louis, IGNORE ses séances (elles ne font pas partie du suivi de Louis).\n\n"
         f"Date du jour : {today}. N'utilise jamais une date future. Si une séance réalisée n'a pas de date "
         "explicite mais est clairement récente (aujourd'hui/hier), déduis la date au plus juste.\n\n"
         "Réponds STRICTEMENT en JSON valide, rien d'autre :\n"
@@ -380,7 +391,8 @@ def extract_realized_sessions(user_number: str, history: list) -> list:
         '  "sessions": [\n'
         '    {"date": "YYYY-MM-DD", "jour": "lundi", "moment": "matin|midi|soir",\n'
         '     "type": "Z2|seuil|fractionné|force|WOD Hyrox|CrossFit|sortie longue|natation|repos|autre",\n'
-        '     "detail": "ce qui a été fait (format, mouvements, charges)", "donnees": "km / allure / FC / temps si mentionnés"}\n'
+        '     "detail": "ce qui a été fait (format, mouvements, charges)", "donnees": "km / allure / FC / temps si mentionnés",\n'
+        '     "rpe": "effort perçu 0-10 si Louis le mentionne (RPE, /10, \'carbonisé\'≈9, \'tranquille\'≈3), sinon \\"\\""}\n'
         "  ]\n"
         "}\n"
         "Le champ moment distingue deux séances du même jour (ex: double/triple journée). "
@@ -423,19 +435,25 @@ def merge_realise(existing: list, extracted: list) -> tuple:
             continue
         if _is_future_date(date, today_str):
             continue  # séance future → c'est du prévu, on rejette
-        # Dédup par (date, type, moment) → distingue deux séances du même type le même jour
-        # (double/triple journée) tout en fusionnant les ré-extractions de la même séance.
+        # Dédup par (date, type, moment) avec moment vide = joker : une ré-extraction de la
+        # même séance sans précision de moment ne doit PAS créer un doublon ("" matche tout).
         existing_s = next(
             (x for x in data if x.get("date") == date and x.get("type") == stype
-             and (x.get("moment") or "") == moment),
+             and ((x.get("moment") or "") == moment or not moment or not (x.get("moment") or ""))),
             None,
         )
         if existing_s:
-            # enrichissement : on garde le detail/donnees le plus long (= le plus informatif)
+            # enrichissement : on garde le detail/donnees le plus long (= le plus informatif),
+            # le moment et le RPE s'ils manquaient
             for field in ("detail", "donnees"):
                 new_v = (s.get(field) or "").strip()
                 if len(new_v) > len(existing_s.get(field) or ""):
                     existing_s[field] = new_v
+            if moment and not (existing_s.get("moment") or ""):
+                existing_s["moment"] = moment
+            new_rpe = str(s.get("rpe") or "").strip()
+            if new_rpe and not str(existing_s.get("rpe") or "").strip():
+                existing_s["rpe"] = new_rpe
             continue
         data.append({
             "date": date,
@@ -444,6 +462,7 @@ def merge_realise(existing: list, extracted: list) -> tuple:
             "type": stype,
             "detail": (s.get("detail") or "").strip(),
             "donnees": (s.get("donnees") or "").strip(),
+            "rpe": str(s.get("rpe") or "").strip(),
             "source": "declared",
         })
         added += 1
@@ -484,6 +503,179 @@ def format_realise(user_number: str, start_date: str, end_date: str) -> str:
         moment = f" {moment}" if moment else ""
         jour = f"{s.get('jour', '')}{moment}".strip()
         lines.append(f"- {s.get('date', '')} ({jour}) {s.get('type', '')} : {s.get('detail', '')}{d}".rstrip())
+    return "\n".join(lines)
+
+
+# ════════════════════════════════════════════════════════════════════
+# MOTEUR DE CHARGE (sRPE × minutes, ratio aigu/chronique, zones)
+# Le code calcule la dose, le LLM communique : Willy ne "devine" plus
+# la charge, il lit un état calculé et applique des règles dures.
+# ════════════════════════════════════════════════════════════════════
+
+# Intensité par défaut (échelle RPE 0-10) quand Louis n'a pas donné son RPE.
+# Le RPE déclaré a TOUJOURS priorité sur ces estimations.
+_DEFAULT_RPE_BY_TYPE = [
+    ("repos", 0), ("natation", 3), ("sortie longue", 5), ("z2", 4),
+    ("fractionn", 8), ("wod", 8), ("crossfit", 7), ("seuil", 7), ("force", 6),
+]
+_DEFAULT_MIN_BY_TYPE = [
+    ("repos", 0), ("natation", 30), ("sortie longue", 75), ("z2", 45),
+    ("fractionn", 45), ("wod", 40), ("crossfit", 60), ("seuil", 45), ("force", 50),
+]
+
+
+def _session_rpe(s: dict) -> float:
+    """RPE déclaré si présent, sinon estimation par type de séance."""
+    raw = str(s.get("rpe") or "").strip()
+    if raw:
+        try:
+            val = float(raw.replace(",", ".").split("/")[0])
+            if 0 <= val <= 10:
+                return val
+        except ValueError:
+            pass
+    stype = (s.get("type") or "").lower()
+    for key, rpe in _DEFAULT_RPE_BY_TYPE:
+        if key in stype:
+            return float(rpe)
+    return 5.0
+
+
+def _session_minutes(s: dict) -> float:
+    """Durée en minutes : parse '34min' / '1h10' dans donnees+detail, sinon défaut par type."""
+    import re
+    text = f"{s.get('donnees', '')} {s.get('detail', '')}"
+    m = re.search(r"(\d+)\s*h\s*(\d{1,2})?", text)
+    if m and int(m.group(1)) <= 5:  # évite de matcher '18h' (heure du jour)
+        return int(m.group(1)) * 60 + int(m.group(2) or 0)
+    m = re.search(r"(\d+)\s*min", text)
+    if m:
+        return float(m.group(1))
+    stype = (s.get("type") or "").lower()
+    for key, minutes in _DEFAULT_MIN_BY_TYPE:
+        if key in stype:
+            return float(minutes)
+    return 45.0
+
+
+def compute_load_state(user_number: str, ref_date: str = None) -> dict:
+    """
+    Calcule l'état de charge depuis les séances réalisées (sRPE = RPE × minutes).
+    - charge_7j : charge aiguë (7 derniers jours)
+    - charge_hebdo_moy : charge hebdomadaire moyenne sur la fenêtre observée (max 28j),
+      dé-biaisée si on a moins de 28 jours de données
+    - ratio : aigu/chronique (ACWR) — <0.8 sous-charge / 0.8-1.3 optimal / 1.3-1.5 élevé / >1.5 rouge
+    Ne lève jamais. Retourne {} si pas de données.
+    """
+    try:
+        sessions = realise.get(user_number) or []
+        if not sessions:
+            return {}
+        paris = pytz.timezone("Europe/Paris")
+        ref = datetime.strptime(ref_date, "%Y-%m-%d").date() if ref_date else datetime.now(paris).date()
+
+        def parse_d(s):
+            try:
+                return datetime.strptime((s.get("date") or "").strip(), "%Y-%m-%d").date()
+            except ValueError:
+                return None
+
+        dated = [(parse_d(s), s) for s in sessions]
+        dated = [(d, s) for d, s in dated if d and d <= ref]
+        if not dated:
+            return {}
+        window = [(d, s) for d, s in dated if (ref - d).days < 28]
+        if not window:
+            return {}
+        first_day = min(d for d, _ in window)
+        jours_data = min((ref - first_day).days + 1, 28)
+        semaines_obs = max(1.0, jours_data / 7.0)
+
+        charges = [((ref - d).days, _session_rpe(s) * _session_minutes(s), s) for d, s in window]
+        total_28j = sum(c for _, c, _ in charges)
+        charge_7j = sum(c for age, c, _ in charges if age < 7)
+        charge_3j = sum(c for age, c, _ in charges if age < 3)
+        charge_hebdo_moy = total_28j / semaines_obs
+        ratio = round(charge_7j / charge_hebdo_moy, 2) if charge_hebdo_moy > 0 else 0.0
+
+        seances_7j = [s for age, c, s in charges if age < 7 and (s.get("type") or "").lower() != "repos"]
+        par_jour: dict = {}
+        for age, c, s in charges:
+            if age < 7 and (s.get("type") or "").lower() != "repos":
+                par_jour.setdefault(s.get("date"), 0)
+                par_jour[s.get("date")] += 1
+        doubles_7j = sum(1 for n in par_jour.values() if n >= 2)
+
+        if ratio > 1.5:
+            zone = "ROUGE"
+        elif ratio > 1.3:
+            zone = "ÉLEVÉE"
+        elif ratio >= 0.8:
+            zone = "OPTIMALE"
+        else:
+            zone = "SOUS-CHARGE"
+        # Fatigue aiguë : un RPE ≥8 déclaré dans les dernières 48h pèse plus que le ratio
+        # (cas réel : ratio optimal car charge chronique haute, mais Louis "carbonisé")
+        rpe_max_48h = max(
+            (_session_rpe(s) for age, c, s in charges if age < 2 and str(s.get("rpe") or "").strip()),
+            default=0,
+        )
+        return {
+            "rpe_max_48h": rpe_max_48h,
+            "charge_7j": round(charge_7j),
+            "charge_3j": round(charge_3j),
+            "charge_hebdo_moy": round(charge_hebdo_moy),
+            "ratio": ratio,
+            "zone": zone,
+            "seances_7j": len(seances_7j),
+            "doubles_7j": doubles_7j,
+            "jours_data": jours_data,
+            "calibration": jours_data < 14,
+        }
+    except Exception as e:
+        print(f"[charge] erreur compute_load_state pour {user_number}: {e}")
+        return {}
+
+
+def format_load_state(user_number: str, ref_date: str = None) -> str:
+    """Bloc ÉTAT DE CHARGE injecté dans les prompts, avec consignes DURES par zone."""
+    st = compute_load_state(user_number, ref_date)
+    if not st:
+        return ""
+    lines = [
+        "═══ ÉTAT DE CHARGE (CALCULÉ PAR LE SYSTÈME — fiable, ne le recalcule pas) ═══",
+        f"Charge 7 derniers jours : {st['charge_7j']} pts ({st['seances_7j']} séances, dont {st['doubles_7j']} jour(s) double)",
+        f"Charge 3 derniers jours : {st['charge_3j']} pts",
+        f"Charge hebdo moyenne observée : {st['charge_hebdo_moy']} pts → RATIO aigu/chronique : {st['ratio']} = ZONE {st['zone']}",
+    ]
+    if st["calibration"]:
+        lines.append(f"⚠️ Calibration en cours ({st['jours_data']} jours de données — fiabilité complète à 14j) : "
+                     "croise avec le ressenti déclaré de Louis avant toute décision ferme.")
+    if st.get("rpe_max_48h", 0) >= 8:
+        lines.append(
+            f"🔥 FATIGUE AIGUË : RPE {st['rpe_max_48h']:.0f}/10 déclaré dans les dernières 48h — ce signal PRIME sur le ratio. "
+            "Les prochaines 24-48h : récup ou très léger, et toute séance intense prévue est conditionnée au ressenti du matin."
+        )
+    if st["zone"] == "ROUGE":
+        lines.append(
+            "🔴 CONSIGNE DURE : INTERDICTION de proposer une séance intense (WOD, fractionné, force lourde, seuil) "
+            "dans les prochaines 48h. Propose repos ou récup active légère, et EXPLIQUE avec ces chiffres. "
+            "Si une séance intense était prévue au plan → tu la dégrades ou la repousses explicitement."
+        )
+    elif st["zone"] == "ÉLEVÉE":
+        lines.append(
+            "🟠 CONSIGNE : zone de vigilance. AUCUNE séance ajoutée hors plan. Les intensités prévues sont maintenues "
+            "UNIQUEMENT si le ressenti/FC réveil est bon — sinon dégrade. Pas de double non prévu."
+        )
+    elif st["zone"] == "SOUS-CHARGE":
+        lines.append(
+            "🟢 CONSIGNE : fenêtre de progression. Si AUCUNE fatigue déclarée récente, tu peux proposer une montée "
+            "de charge argumentée (volume Z2 +10-15%, ou une intensité de qualité en plus). Si fatigue déclarée → ignore cette fenêtre."
+        )
+    else:
+        lines.append("🟢 CONSIGNE : zone optimale — déroule le plan prévu, pas de zèle dans un sens ou l'autre.")
+    lines.append("Toute recommandation de séance DOIT être cohérente avec cet état de charge. "
+                 "Si Louis demande un entraînement incompatible, tu refuses avec les chiffres.")
     return "\n".join(lines)
 
 
@@ -734,6 +926,28 @@ Quand les données Strava apparaissent dans ton contexte :
 → Après "wod terminé" : analyse immédiate et précise de la dernière activité (perf, allure, FC, comparaison avec les précédentes) + impact sur la suite
 → Croise toujours Strava + mémoire profil pour personnaliser
 
+H. ANALYSE DE SÉANCE = FAITS DONNÉS UNIQUEMENT
+Quand tu analyses une séance, tu cites UNIQUEMENT les éléments que Louis ou Strava ont explicitement fournis
+(mouvements, charges, temps, formats). Tu ne complètes JAMAIS un format de toi-même, tu n'extrapoles JAMAIS
+un détail manquant. S'il te manque une donnée utile : demande-la UNE fois, ou analyse sans elle.
+
+I. QUESTIONS — JAMAIS DE HARCÈLEMENT
+- La même question posée 2 fois sans réponse = Louis a choisi de ne pas répondre → tu LÂCHES définitivement.
+- Si Louis exprime frustration, agacement ou colère : tu traites ÇA d'abord, et ce message ne contient AUCUNE question.
+- Une seule question par message maximum, et seulement si elle est utile à la décision suivante.
+
+J. FATIGUE DÉCLARÉE = DONNÉE DE PROGRAMMATION PRIORITAIRE
+Si Louis exprime une fatigue inhabituelle, une douleur, ou des mots comme "carbonisé", "explosé", "cramé" :
+1. C'est un SIGNAL d'entraînement, jamais une banalité.
+2. Tu réévalues EXPLICITEMENT les 48h à venir : maintenir / alléger / repousser — avec le pourquoi.
+3. INTERDIT de répondre "c'est normal" sans statuer sur la suite du programme.
+4. Avant un jour double, tu conditionnes la 2e séance au ressenti/FC réveil du matin même.
+Ce signal PRIME sur la zone de charge calculée si les deux divergent.
+
+K. RPE — LE CARBURANT DE TON MOTEUR DE CHARGE
+Après chaque débrief de séance où Louis n'a pas donné son effort perçu, demande UNE fois : "RPE sur 10 ?".
+C'est la donnée qui calibre ton état de charge — explique-le-lui si besoin. Jamais deux relances.
+
 G. SIGNAUX & RENDEZ-VOUS AUTOMATIQUES (mécanique système à connaître)
 
 ⚡ MOTS-CLÉS TRIGGER de Louis :
@@ -741,7 +955,7 @@ G. SIGNAUX & RENDEZ-VOUS AUTOMATIQUES (mécanique système à connaître)
 - "strava" / "connecter strava" : déclenche la reconnexion OAuth (géré par le code, pas par toi).
 
 📅 RENDEZ-VOUS HEBDO AUTOMATIQUE :
-Tu envoies automatiquement un bilan structuré chaque DIMANCHE 18h Paris (analyse quanti + quali + programme S+1 + vision S+2/S+4).
+Tu envoies automatiquement un bilan structuré chaque DIMANCHE 18h Paris (analyse quanti + quali + programme S+1 + trajectoire de phase). Un check-in de pré-bilan part à 17h30 pour compléter les séances manquantes.
 Tu peux faire référence à ce rendez-vous dans la semaine ("on détaille ça dimanche", "comme vu dimanche dernier").
 
 🧠 TA MÉMOIRE EST FINIE EN DÉTAIL :
@@ -872,6 +1086,11 @@ def compress_history(user_number: str, history: list[dict]) -> str:
         "- Ce que Louis a partagé d'important sur sa vie/agenda/motivation\n\n"
         "Si l'historique ne contient rien de nouveau d'intéressant, RETOURNE l'ancien résumé tel quel "
         "(jamais 'Aucune information disponible' ou similaire — ce serait une régression).\n\n"
+        "📏 GESTION DE LA PLACE (le résumé a un budget limité) :\n"
+        "- Les consignes/avertissements méta (⚠️ règles de lecture, erreurs passées du coach) tiennent dans UNE "
+        "section compacte 'Règles de coaching' de 6 lignes MAX : fusionne les doublons, ne les répète jamais.\n"
+        "- La place est prioritairement pour les DONNÉES de Louis : séances, perfs, ressentis, blessures, contraintes.\n"
+        "- Les semaines réalisées de plus de 3 semaines : compresse-les en 1-2 lignes de tendance (ne liste plus séance par séance).\n\n"
     )
     if existing_summary:
         prompt += f"RÉSUMÉ ACTUEL À METTRE À JOUR :\n{existing_summary}\n\n"
@@ -879,10 +1098,14 @@ def compress_history(user_number: str, history: list[dict]) -> str:
 
     response = get_anthropic_client().messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=1200,
+        max_tokens=2000,  # 1200 saturait : résumé tronqué en pleine phrase (constaté le 09/06)
         system="Tu es un assistant mémoire de coaching sportif. Sois concis, factuel et cumulatif.",
         messages=[{"role": "user", "content": prompt}],
     )
+    if response.stop_reason == "max_tokens":
+        # Résumé TRONQUÉ = perte de données garantie → on le rejette (l'appelant gardera l'ancien).
+        print(f"[compress] TRONQUÉ (max_tokens atteint) pour {user_number} — résumé rejeté, ancien conservé")
+        return ""
     return response.content[0].text
 
 
@@ -971,6 +1194,11 @@ def _get_ai_response_locked(user_number: str, user_message: str) -> str:
     if plan_block:
         system += f"\n\n{plan_block}"
 
+    # MOTEUR DE CHARGE : état calculé + consignes dures (le LLM ne jauge plus la dose lui-même)
+    load_block = format_load_state(user_number)
+    if load_block:
+        system += f"\n\n{load_block}"
+
     if strava_data:
         system += f"\n\n{strava_data}\n\nUtilise ces données pour personnaliser tes conseils si pertinent."
         if is_new_session:
@@ -985,6 +1213,14 @@ def _get_ai_response_locked(user_number: str, user_message: str) -> str:
                 "sa dernière activité Strava (perf, allure, FC, comparaison avec les précédentes). "
                 "Donne un feedback précis et motivant, et dis-lui ce que ça implique pour la suite."
             )
+
+    # RAPPEL DATE EN DERNIÈRE POSITION : les LLM pondèrent fortement la fin du contexte.
+    # Anti-bug "on est mardi" du 10/06 : le pattern des séances avait battu la date écrite en haut.
+    system += (
+        f"\n\n⏰ RAPPEL FINAL — LA DATE (prioritaire sur toute déduction) : nous sommes "
+        f"{now.strftime('%A %d %B %Y')}, il est {heure}. Si un raisonnement te fait conclure à un autre "
+        f"jour de la semaine, c'est ton raisonnement qui est faux, pas cette date."
+    )
 
     response = get_anthropic_client().messages.create(
         model="claude-sonnet-4-6",
@@ -1052,16 +1288,27 @@ def webhook():
 
 @app.route("/admin/synthesize", methods=["POST"])
 def admin_synthesize():
-    data = request.get_json()
-    number = data.get("number") if data else None
+    # Écrase la mémoire prose → ADMIN_SECRET + mêmes garde-fous que la compression
+    # automatique (backup avant écriture + validation anti-régression).
+    data = request.get_json(silent=True) or {}
+    if data.get("secret") != ADMIN_SECRET:
+        return {"status": "unauthorized"}, 401
+    number = data.get("number")
     if not number or number not in conversation_histories:
         return {"status": "error", "message": "Utilisateur introuvable ou historique vide"}, 404
     history = conversation_histories[number]
     if not history:
         return {"status": "error", "message": "Historique vide"}, 400
-    summary = compress_history(number, history)
-    athlete_summaries[number] = summary
-    persist_set("athlete_summaries", athlete_summaries)
+    with get_user_lock(number):
+        old_summary = athlete_summaries.get(number, "")
+        summary = compress_history(number, history)
+        is_valid, reason = is_valid_summary(summary, old_summary)
+        if not is_valid:
+            return {"status": "rejected", "reason": reason, "old_kept": True}, 422
+        if old_summary:
+            backup_summary(number)
+        athlete_summaries[number] = summary
+        persist_set("athlete_summaries", athlete_summaries)
     return {"status": "ok", "summary": summary}, 200
 
 
@@ -1163,6 +1410,8 @@ def admin_memory():
             "training_plan_formatted": format_training_plan(user),
             "realise": realise.get(user, []),
             "realise_count": len(realise.get(user, [])),
+            "load_state": compute_load_state(user),
+            "load_state_formatted": format_load_state(user),
         }, 200
 
     if action == "list_backups":
@@ -1226,6 +1475,14 @@ def admin_memory():
         except Exception as e:
             return {"status": "error", "error": str(e)}, 500
 
+    if action == "run_checkin":
+        # Déclenche le check-in pré-bilan à la demande (envoie un vrai WhatsApp à CE user).
+        try:
+            pre_bilan_checkin(only_user=user)
+            return {"status": "ok", "ran_for": user}, 200
+        except Exception as e:
+            return {"status": "error", "error": str(e)}, 500
+
     if action == "clean_carnet":
         # Nettoyage one-shot du carnet : supprime les entrées datées dans le FUTUR
         # (= des cibles/prévus qui ont pollué le carnet avant le fix d'extraction).
@@ -1261,7 +1518,7 @@ def admin_memory():
                 persist_set("realise", realise)
         return {"status": "ok", "added": added, "total": len(realise.get(user, []))}, 200
 
-    return {"status": "unknown action", "valid_actions": ["dump", "list_backups", "restore", "restore_from_backup", "run_weekly", "clean_carnet", "set_realise"]}, 400
+    return {"status": "unknown action", "valid_actions": ["dump", "list_backups", "restore", "restore_from_backup", "run_weekly", "run_checkin", "clean_carnet", "set_realise"]}, 400
 
 
 @app.route("/admin/backup", methods=["POST"])
@@ -1330,11 +1587,15 @@ def health():
 
 @app.route("/reset", methods=["POST"])
 def reset_conversation():
-    data = request.get_json()
-    number = data.get("number") if data else None
+    # Endpoint destructeur → protégé par ADMIN_SECRET (le repo et l'URL sont publics)
+    data = request.get_json(silent=True) or {}
+    if data.get("secret") != ADMIN_SECRET:
+        return {"status": "unauthorized"}, 401
+    number = data.get("number")
     if number and number in conversation_histories:
-        del conversation_histories[number]
-        persist_set("conversation_histories", conversation_histories)
+        with get_user_lock(number):
+            del conversation_histories[number]
+            persist_set("conversation_histories", conversation_histories)
         return {"status": "reset", "number": number}, 200
     return {"status": "not_found"}, 404
 
@@ -1481,11 +1742,15 @@ def weekly_summary(only_user: str = None):
             f"mais reste PRUDENT : n'affirme pas une séance dont tu n'as pas la preuve, et ne déduis pas "
             f"de séances de muscu/CrossFit/WOD à partir de Strava (Strava ne les contient pas)."
         )
+        # ÉTAT DE CHARGE calculé : le dosage du programme S+1 doit s'y conformer
+        load_block = format_load_state(user_number, reviewed_end)
+        load_section = f"\n\n{load_block}\nLe PROGRAMME S+1 doit être DOSÉ en fonction de cet état (volume et intensités)." if load_block else ""
+
         prompt = (
             f"Tu es Willy Georges, coach Hyrox professionnel. Tu fais le bilan hebdomadaire de Louis.\n\n"
             f"Objectifs : Barcelone Hyrox (~15 nov 2026) | Milan Sub-60 (objectif principal, ~13 déc 2026). "
             f"Raisonne en PHASES du cycle, pas en compte à rebours de jours.{phase_block}{prevu_block}"
-            f"{realise_section}\n\n"
+            f"{realise_section}{load_section}\n\n"
             f"═══ DONNÉES STRAVA (CROIS-CHECK cardio uniquement, PAS la source de vérité) ═══\n"
             f"Sert-toi de Strava pour préciser allures/FC/distances des séances de course, PAS pour "
             f"déterminer la liste des séances faites.\n{strava_data}\n\n"
@@ -1548,6 +1813,43 @@ def weekly_summary(only_user: str = None):
             print(f"[plan] erreur stockage S+1 pour {user_number}: {e}")
 
 
+def pre_bilan_checkin(only_user: str = None):
+    """
+    Dimanche 17h30 (30 min avant le bilan) : envoie à Louis la liste des séances
+    LOGUÉES cette semaine et demande ce qui manque + les RPE. Garantit que le bilan
+    de 18h tourne sur un réalisé complet. Ne lève jamais.
+    """
+    paris = pytz.timezone("Europe/Paris")
+    today = datetime.now(paris)
+    week_start = (today - timedelta(days=6)).strftime("%Y-%m-%d")
+    week_end = today.strftime("%Y-%m-%d")
+    for user_number in list(strava_tokens.keys()):
+        if only_user and user_number != only_user:
+            continue
+        try:
+            # Flush des tout derniers débriefs avant d'afficher la liste
+            with get_user_lock(user_number):
+                update_realise(user_number, conversation_histories.get(user_number) or [])
+            logged = format_realise(user_number, week_start, week_end)
+            if logged:
+                msg = (
+                    "🔍 Check rapide avant ton bilan de 18h — voilà les séances que j'ai loguées cette semaine :\n\n"
+                    f"{logged}\n\n"
+                    "Il manque quelque chose ? Balance les séances oubliées (+ ton RPE /10 si tu l'as). "
+                    "Sinon réponds juste 'ok' et je te sors le bilan sur cette base. 💪"
+                )
+            else:
+                msg = (
+                    "🔍 Avant ton bilan de 18h : je n'ai AUCUNE séance loguée cette semaine. "
+                    "Balance-moi un récap rapide de ce que t'as fait (séances + RPE /10), "
+                    "sinon le bilan tournera uniquement sur Strava. 💪"
+                )
+            send_whatsapp(user_number, msg)
+            print(f"[checkin] pré-bilan envoyé à {user_number}")
+        except Exception as e:
+            print(f"[checkin] erreur pour {user_number}: {e}")
+
+
 def daily_consolidation():
     """
     Passe quotidienne d'extraction de la mémoire structurée.
@@ -1581,6 +1883,8 @@ def daily_consolidation():
 # Scheduler — bilan automatique chaque dimanche à 18h heure de Paris
 scheduler = BackgroundScheduler(timezone=pytz.timezone("Europe/Paris"))
 scheduler.add_job(weekly_summary, "cron", day_of_week="sun", hour=18, minute=0)
+# Check-in pré-bilan : 30 min avant, pour compléter le réalisé (séances manquantes + RPE)
+scheduler.add_job(pre_bilan_checkin, "cron", day_of_week="sun", hour=17, minute=30)
 # Consolidation mémoire structurée chaque jour à 2h (Paris), avant le backup externe (3h UTC = 4-5h Paris)
 scheduler.add_job(daily_consolidation, "cron", hour=2, minute=0)
 scheduler.start()

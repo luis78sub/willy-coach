@@ -17,6 +17,16 @@ def init_db():
             """)
         conn.commit()
 
+def db_ping():
+    """
+    Vérifie que la DB répond. LÈVE en cas d'échec — appelé au boot :
+    mieux vaut crasher franchement (Render redémarre le service) que démarrer
+    avec un état vide et écraser la base au premier persist_set.
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+
 def db_get(key: str, default=None):
     try:
         with get_conn() as conn:
@@ -37,7 +47,10 @@ def db_set(key: str, value):
                 """, (key, json.dumps(value)))
             conn.commit()
     except Exception as e:
-        print(f"db_set error: {e}")
+        # Échec d'écriture = divergence RAM/DB silencieuse → log BRUYANT pour les logs Render.
+        # (Pas de json.dumps ici : si la valeur est non-sérialisable, le log crasherait aussi.)
+        print(f"❌❌❌ [db] ÉCHEC D'ÉCRITURE clé '{key}' : {type(e).__name__}: {e} "
+              f"— l'état mémoire et la base DIVERGENT jusqu'à la prochaine écriture réussie")
 
 def db_dump_all() -> dict:
     """Retourne TOUTE la base (toutes les clés du store) sous forme de dict."""

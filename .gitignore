@@ -5,3 +5,5 @@ __pycache__/
 generate_recap.py
 recap_willy_agent.pdf
 start.sh
+
+.DS_Store
