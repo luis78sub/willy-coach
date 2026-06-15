@@ -85,7 +85,8 @@ athlete_data: dict = persist_get("athlete_data", {})
 # {"phases": [{nom, debut, fin, focus, cible}],          # macro 6 mois (squelette validé)
 #  "semaine_courante": {debut, fin, phase, objectif,     # micro : semaine planifiée
 #                       seances: [{jour, date, type, detail, rationale}]},
-#  "historique": [{debut, phase, prevu_resume, realise_resume, adherence}]}  # méso : archive
+#  "historique": [{debut, fin, phase, type_semaine, charge, ratio, volume_km, nb_seances,
+#                  nb_doubles, ef, prevu_resume, realise_resume, adherence}]}  # méso : carnet de semaines
 training_plan: dict = persist_get("training_plan", {})
 # Mémoire RÉALISÉ (séances que Louis DÉCLARE avoir faites, loguées au fil de l'eau).
 # = source de vérité du "réalisé" pour le bilan (Strava ne couvre pas la muscu/CrossFit/WOD).
@@ -896,10 +897,11 @@ def get_next_phase(user_number: str, ref_date: str = None) -> dict:
     return min(futures, key=lambda p: p.get("debut") or "", default={})
 
 
-def set_week_plan(user_number: str, week: dict, adherence: str = "", realise_resume: str = "") -> bool:
+def set_week_plan(user_number: str, week: dict, adherence: str = "", realise_resume: str = "", digest: dict = None) -> bool:
     """
-    Archive la semaine courante dans l'historique (avec prévu/réalisé/adhérence) puis installe
-    la nouvelle. Backup avant écriture. ADDITIF sur l'historique. Ne lève jamais.
+    Archive la semaine courante dans l'historique (avec digest calculé + type_semaine) puis installe
+    la nouvelle. Le type de la nouvelle semaine est auto-décidé (build/décharge) depuis l'historique
+    mis à jour, sauf si déjà fixé. Backup avant écriture. ADDITIF. Ne lève jamais.
     """
     try:
         plan = training_plan.get(user_number) or _empty_training_plan()
@@ -914,14 +916,21 @@ def set_week_plan(user_number: str, week: dict, adherence: str = "", realise_res
                 f"{s.get('jour', '?')}: {s.get('type', '')} {s.get('detail', '')}".strip()
                 for s in seances
             )
-            plan["historique"].append({
+            entry = {
                 "debut": old.get("debut", ""),
+                "fin": old.get("fin", ""),
                 "phase": old.get("phase", ""),
-                "prevu_resume": prevu[:1000],
-                "realise_resume": (realise_resume or "")[:1000],
+                "type_semaine": old.get("type_semaine", "build"),
+                "prevu_resume": prevu[:600],
+                "realise_resume": (realise_resume or "")[:600],
                 "adherence": adherence,
-            })
+            }
+            entry.update(digest or {})  # charge, volume_km, nb_seances, nb_doubles, ef, ratio
+            plan["historique"].append(entry)
             plan["historique"] = plan["historique"][-26:]  # ~6 mois d'archives
+        # Type de la nouvelle semaine : auto-décidé depuis l'historique fraîchement mis à jour
+        if not week.get("type_semaine"):
+            week["type_semaine"] = _decide_week_type_from_hist(plan["historique"])
         plan["semaine_courante"] = week
         training_plan[user_number] = plan
         persist_set("training_plan", training_plan)
@@ -958,6 +967,102 @@ def format_training_plan(user_number: str) -> str:
             lines.append(f"  - {s.get('jour', '?')} {s.get('date', '')}: {detail}")
     lines.append("Rappel : la force est un pilier PERMANENT de la prépa (ne jamais l'abandonner).")
     lines.append("Programme et conseille en cohérence avec la phase et la semaine prévue ci-dessus.")
+    return "\n".join(lines)
+
+
+# ════════════════════════════════════════════════════════════════════
+# CARNET DE SEMAINES (méso) — une ligne factuelle calculée par semaine,
+# pour que Willy RAISONNE sur le cycle (montée de charge, décharge).
+# ════════════════════════════════════════════════════════════════════
+DELOAD_AFTER_BUILD_WEEKS = 4      # décharge après 4 semaines de build
+DELOAD_CHARGE_REDUCTION = 0.35    # -35% de charge sur une semaine de décharge
+
+
+def compute_week_digest(user_number: str, week_start: str, week_end: str) -> dict:
+    """Digest factuel calculé d'une semaine (charge, volume km, EF moyen, nb séances) depuis le réalisé. {} si vide."""
+    import re
+    sessions = [s for s in (realise.get(user_number) or []) if week_start <= (s.get("date") or "") <= week_end]
+    actives = [s for s in sessions if (s.get("type") or "").lower() != "repos"]
+    if not actives:
+        return {}
+    charge = round(sum(_session_rpe(s) * _session_minutes(s) for s in actives))
+    km = 0.0
+    for s in sessions:
+        m = re.search(r"(\d+(?:[.,]\d+)?)\s*km", s.get("donnees", "") or "")
+        if m:
+            km += float(m.group(1).replace(",", "."))
+    par_jour: dict = {}
+    for s in actives:
+        par_jour[s.get("date")] = par_jour.get(s.get("date"), 0) + 1
+    doubles = sum(1 for n in par_jour.values() if n >= 2)
+    efs = []
+    for s in actives:
+        t = (s.get("type") or "").lower()
+        if any(k in t for k in ("z2", "sortie longue", "seuil")):
+            txt = f"{s.get('donnees', '')} {s.get('detail', '')}"
+            p, f = _parse_pace_sec(txt), _parse_fc(txt)
+            if p and f:
+                efs.append((60000.0 / p) / f)
+    d = {"charge": charge, "volume_km": round(km, 1), "nb_seances": len(actives), "nb_doubles": doubles}
+    if efs:
+        d["ef"] = round(sum(efs) / len(efs), 3)
+    ratio = (compute_load_state(user_number, week_end) or {}).get("ratio")
+    if ratio is not None:
+        d["ratio"] = ratio
+    return d
+
+
+def _decide_week_type_from_hist(hist: list) -> str:
+    """Décide build/décharge depuis l'historique (déterministe). Override surcharge prioritaire."""
+    last_ratios = [h.get("ratio") for h in hist[-2:] if isinstance(h.get("ratio"), (int, float))]
+    if len(last_ratios) == 2 and all(r > 1.4 for r in last_ratios):
+        return "décharge"
+    streak = 0
+    for h in reversed(hist):
+        if (h.get("type_semaine") or "build") == "build":
+            streak += 1
+        else:
+            break
+    return "décharge" if streak >= DELOAD_AFTER_BUILD_WEEKS else "build"
+
+
+def decide_next_week_type(user_number: str) -> str:
+    """Type de la prochaine semaine d'après l'historique stocké (wrapper public)."""
+    return _decide_week_type_from_hist((training_plan.get(user_number) or {}).get("historique") or [])
+
+
+def format_cycle(user_number: str) -> str:
+    """Bloc CARNET DE SEMAINES injecté en chat — l'arc du cycle, compact et factuel."""
+    plan = training_plan.get(user_number) or {}
+    hist = plan.get("historique") or []
+    cur = plan.get("semaine_courante") or {}
+    if not hist and not cur.get("seances"):
+        return ""
+    lines = ["═══ CARNET DE SEMAINES (cycle — pour raisonner sur la périodisation, NE recalcule rien) ═══"]
+    phase = get_current_phase(user_number)
+    if phase:
+        try:
+            pd = datetime.strptime(phase.get("debut", ""), "%Y-%m-%d").date()
+            pf = datetime.strptime(phase.get("fin", ""), "%Y-%m-%d").date()
+            now = datetime.now(pytz.timezone("Europe/Paris")).date()
+            sem = max(1, (now - pd).days // 7 + 1)
+            tot = max(1, (pf - pd).days // 7 + 1)
+            lines.append(f"Phase {phase.get('nom', '')} · semaine {sem}/{tot} (cible : {phase.get('cible', '')})")
+        except Exception:
+            pass
+    for h in hist[-7:]:
+        seg = f"{(h.get('debut', '') or '')[5:]}→{(h.get('fin', '') or '')[5:]}"
+        parts = [f"charge {h.get('charge', '?')}", f"{h.get('nb_seances', '?')} séances"]
+        if h.get("nb_doubles"):
+            parts.append(f"{h['nb_doubles']} doubles")
+        if h.get("ef"):
+            parts.append(f"EF {h['ef']}")
+        if h.get("ratio"):
+            parts.append(f"ratio {h['ratio']}")
+        lines.append(f"• {seg} : " + " | ".join(parts) + f" → {(h.get('type_semaine') or 'build').upper()}")
+    if cur.get("seances") or cur.get("type_semaine"):
+        lines.append(f"• {(cur.get('debut', '') or '')[5:]}→{(cur.get('fin', '') or '')[5:]} (EN COURS) : {(cur.get('type_semaine') or 'build').upper()}")
+    lines.append(f"Règle : décharge (~-{int(DELOAD_CHARGE_REDUCTION*100)}% de charge) toutes les {DELOAD_AFTER_BUILD_WEEKS} semaines de build, ou si surcharge. Explique la logique du cycle avec ce carnet.")
     return "\n".join(lines)
 
 
@@ -1389,6 +1494,11 @@ def _get_ai_response_locked(user_number: str, user_message: str) -> str:
     if load_block:
         system += f"\n\n{load_block}"
 
+    # CARNET DE SEMAINES : l'arc du cycle (charge/EF par semaine) pour raisonner sur la périodisation
+    cycle_block = format_cycle(user_number)
+    if cycle_block:
+        system += f"\n\n{cycle_block}"
+
     if strava_data:
         system += f"\n\n{strava_data}\n\nUtilise ces données pour personnaliser tes conseils si pertinent."
         if is_new_session:
@@ -1604,6 +1714,7 @@ def admin_memory():
             "realise_count": len(realise.get(user, [])),
             "load_state": compute_load_state(user),
             "load_state_formatted": format_load_state(user),
+            "cycle_formatted": format_cycle(user),
         }, 200
 
     if action == "list_backups":
@@ -1940,11 +2051,28 @@ def weekly_summary(only_user: str = None):
         load_block = format_load_state(user_number, reviewed_end)
         load_section = f"\n\n{load_block}\nLe PROGRAMME S+1 doit être DOSÉ en fonction de cet état (volume et intensités)." if load_block else ""
 
+        # CARNET DE SEMAINES : digest de la semaine écoulée + décision du type de S+1 (build/décharge)
+        reviewed_digest = compute_week_digest(user_number, reviewed_start, reviewed_end)
+        # Aperçu de l'historique INCLUANT la semaine qu'on va archiver, pour décider S+1 avant de pondre le programme
+        _cur_type = (prevu.get("type_semaine") if isinstance(prevu, dict) else None) or "build"
+        _hist_preview = ((training_plan.get(user_number) or {}).get("historique") or []) + [
+            {"type_semaine": _cur_type, "ratio": reviewed_digest.get("ratio")}
+        ]
+        next_week_type = _decide_week_type_from_hist(_hist_preview)
+        deload_section = ""
+        if next_week_type == "décharge":
+            deload_section = (
+                f"\n\n⚠️ S+1 = SEMAINE DE DÉCHARGE (planifiée) : après {DELOAD_AFTER_BUILD_WEEKS} semaines de montée en charge "
+                f"(ou surcharge détectée), réduis la charge d'environ {int(DELOAD_CHARGE_REDUCTION*100)}% — surtout le VOLUME, "
+                f"garde un peu d'intensité courte pour ne pas s'endormir. C'est une semaine d'ABSORPTION pour rebondir. "
+                f"Explique clairement à Louis POURQUOI c'est une décharge (les semaines de build derrière)."
+            )
+
         prompt = (
             f"Tu es Willy Georges, coach Hyrox professionnel. Tu fais le bilan hebdomadaire de Louis.\n\n"
             f"Objectifs : Barcelone Hyrox (mi-novembre 2026) | Milan Sub-60 (objectif principal, mi-décembre 2026). "
             f"Raisonne en PHASES du cycle. INTERDIT d'écrire un compte à rebours en jours (jamais de 'J-XXX').{phase_block}{prevu_block}"
-            f"{realise_section}{aero_section}{load_section}\n\n"
+            f"{realise_section}{aero_section}{load_section}{deload_section}\n\n"
             f"═══ DONNÉES STRAVA (CROIS-CHECK cardio uniquement, PAS la source de vérité) ═══\n"
             f"Sert-toi de Strava pour préciser allures/FC/distances, PAS pour déterminer la liste des séances.\n{strava_data}\n\n"
             f"═══ MÉMOIRE PROFIL LOUIS ═══\n{summary}\n\n"
@@ -1991,9 +2119,10 @@ def weekly_summary(only_user: str = None):
             phase_nom = phase.get("nom", "") if phase else ""
             week = extract_week_plan(user_number, bilan, week_start, week_end, phase_nom)
             if week and week.get("seances"):
+                week["type_semaine"] = next_week_type  # cohérent avec le programme dosé ci-dessus
                 with get_user_lock(user_number):
-                    set_week_plan(user_number, week, realise_resume=(realise_block or strava_data)[:1000])
-                print(f"[plan] semaine S+1 stockée pour {user_number} ({len(week['seances'])} séances)")
+                    set_week_plan(user_number, week, realise_resume=(realise_block or strava_data)[:1000], digest=reviewed_digest)
+                print(f"[plan] semaine S+1 ({next_week_type}) stockée pour {user_number} ({len(week['seances'])} séances)")
         except Exception as e:
             print(f"[plan] erreur stockage S+1 pour {user_number}: {e}")
 
