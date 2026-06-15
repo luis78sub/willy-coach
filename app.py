@@ -364,10 +364,11 @@ def backup_realise(user_number: str):
     persist_set(key, snapshots)
 
 
-def extract_realized_sessions(user_number: str, history: list) -> list:
+def extract_realized_sessions(user_number: str, history: list, existing_sessions: list = None) -> list:
     """
     Extrait les séances que Louis DÉCLARE avoir réellement faites (jamais le prévu).
-    Retourne une liste de séances. Ne lève jamais (retourne [] en cas d'échec).
+    `existing_sessions` (séances déjà loguées) est réinjecté pour éviter de re-loguer /
+    fragmenter une séance déjà connue. Retourne une liste. Ne lève jamais.
     """
     if not history:
         return []
@@ -376,6 +377,20 @@ def extract_realized_sessions(user_number: str, history: list) -> list:
         for m in history
     )
     today = datetime.now(pytz.timezone("Europe/Paris")).strftime("%Y-%m-%d")
+    # Feed-back : on montre au LLM les séances RÉCENTES déjà loguées pour qu'il ne les
+    # re-crée pas sous un type/moment légèrement différent (cause des fragments).
+    deja_block = ""
+    recent = [s for s in (existing_sessions or []) if (s.get("date") or "") >= (
+        (datetime.now(pytz.timezone("Europe/Paris")) - timedelta(days=12)).strftime("%Y-%m-%d"))]
+    if recent:
+        lignes = "\n".join(
+            f"- {s.get('date','')} ({s.get('moment','') or '?'}) {s.get('type','')} : {(s.get('detail','') or '')[:50]}"
+            for s in recent
+        )
+        deja_block = (
+            "SÉANCES DÉJÀ LOGUÉES ces 12 derniers jours (NE LES RE-LOGUE PAS ; ne crée une entrée que pour "
+            "une séance ABSENTE de cette liste) :\n" + lignes + "\n\n"
+        )
     prompt = (
         "Tu lis une conversation entre Louis (athlète) et son coach. Extrais UNIQUEMENT les séances "
         "que LOUIS DÉCLARE EXPLICITEMENT avoir RÉELLEMENT faites (passées, terminées).\n\n"
@@ -383,20 +398,26 @@ def extract_realized_sessions(user_number: str, history: list) -> list:
         "une intention ('je vais faire'), une séance dont tu n'es pas sûr qu'elle a eu lieu. "
         "En cas de doute → ne l'extrais pas. Mieux vaut rien que d'inventer une séance.\n"
         "🚫 Ce téléphone est parfois utilisé par la femme de Louis : si un message semble venir d'une autre "
-        "personne que Louis, IGNORE ses séances (elles ne font pas partie du suivi de Louis).\n\n"
+        "personne que Louis, IGNORE ses séances.\n"
+        "🚫 IGNORE les activités non-sportives ou involontaires (tonte de pelouse, marche utilitaire, "
+        "déplacement, jardinage) même si Strava les enregistre comme activité.\n\n"
+        "⚠️ UNE séance = UNE seule entrée. Ne fragmente JAMAIS une même séance en plusieurs lignes : "
+        "un échauffement + le bloc principal = 1 entrée ; un fractionné = 1 entrée (pas 'matin' ET 'midi'). "
+        "Ne crée plusieurs entrées le même jour QUE si ce sont des séances vraiment distinctes (ex: course le matin ET muscu le soir).\n\n"
         f"Date du jour : {today}. N'utilise jamais une date future. Si une séance réalisée n'a pas de date "
         "explicite mais est clairement récente (aujourd'hui/hier), déduis la date au plus juste.\n\n"
+        + deja_block +
         "Réponds STRICTEMENT en JSON valide, rien d'autre :\n"
         "{\n"
         '  "sessions": [\n'
         '    {"date": "YYYY-MM-DD", "jour": "lundi", "moment": "matin|midi|soir",\n'
-        '     "type": "Z2|seuil|fractionné|force|WOD Hyrox|CrossFit|sortie longue|natation|repos|autre",\n'
+        '     "type": "Z2|seuil|fractionné|force|WOD Hyrox|CrossFit|sortie longue|natation|repos",\n'
         '     "detail": "ce qui a été fait (format, mouvements, charges)", "donnees": "km / allure / FC / temps si mentionnés",\n'
         '     "rpe": "effort perçu 0-10 si Louis le mentionne (RPE, /10, \'carbonisé\'≈9, \'tranquille\'≈3), sinon \\"\\""}\n'
         "  ]\n"
         "}\n"
-        "Le champ moment distingue deux séances du même jour (ex: double/triple journée). "
-        "Si le moment n'est pas précisé, mets une chaîne vide.\n"
+        "Choisis TOUJOURS le type le plus proche dans la liste ci-dessus (pas de type 'autre', pas de type inventé).\n"
+        "Le champ moment distingue deux séances DISTINCTES du même jour. Si non précisé, mets une chaîne vide.\n"
         'Si Louis ne déclare aucune séance réalisée, renvoie {"sessions": []}.\n\n'
         f"CONVERSATION :\n{messages_text}"
     )
@@ -473,10 +494,10 @@ def merge_realise(existing: list, extracted: list) -> tuple:
 def update_realise(user_number: str, history: list) -> int:
     """Extrait + fusionne (additif) les séances réalisées. Backup avant écriture. Ne lève jamais."""
     try:
-        extracted = extract_realized_sessions(user_number, history)
+        existing = realise.get(user_number) or []
+        extracted = extract_realized_sessions(user_number, history, existing_sessions=existing)
         if not extracted:
             return 0
-        existing = realise.get(user_number) or []
         merged, added = merge_realise(existing, extracted)
         if added > 0:
             backup_realise(user_number)
@@ -487,6 +508,26 @@ def update_realise(user_number: str, history: list) -> int:
     except Exception as e:
         print(f"[realise] erreur update_realise pour {user_number}: {e}")
         return 0
+
+
+def format_realise_recent(user_number: str, days: int = 10) -> str:
+    """
+    Bloc des séances réalisées des `days` derniers jours, DATÉES et avec le jour,
+    injecté dans le prompt de CHAT. Sans lui, Willy reconstruit les jours de tête
+    ("ce matin le fractionné") au lieu de lire la date réelle.
+    """
+    paris = pytz.timezone("Europe/Paris")
+    end = datetime.now(paris).strftime("%Y-%m-%d")
+    start = (datetime.now(paris) - timedelta(days=days)).strftime("%Y-%m-%d")
+    block = format_realise(user_number, start, end)
+    if not block:
+        return ""
+    return (
+        f"📋 TES SÉANCES RÉELLEMENT FAITES ces {days} derniers jours (source de vérité, DATÉE) :\n"
+        f"{block}\n"
+        "RÈGLE ABSOLUE : quand tu parles d'une de ces séances, recopie sa DATE et son JOUR depuis cette liste. "
+        "INTERDIT de dire 'ce matin / hier / aujourd'hui' pour une séance passée — tu ne calcules jamais un jour, tu le LIS ici."
+    )
 
 
 def format_realise(user_number: str, start_date: str, end_date: str) -> str:
@@ -504,6 +545,130 @@ def format_realise(user_number: str, start_date: str, end_date: str) -> str:
         jour = f"{s.get('jour', '')}{moment}".strip()
         lines.append(f"- {s.get('date', '')} ({jour}) {s.get('type', '')} : {s.get('detail', '')}{d}".rstrip())
     return "\n".join(lines)
+
+
+_JOURS_FR = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"]
+
+
+def format_realise_table(user_number: str, start_date: str, end_date: str) -> str:
+    """
+    Tableau Markdown du réalisé construit EN PYTHON (jamais par le LLM) → zéro hallucination
+    de date/séance. C'est le tableau factuel collé tel quel en tête du bilan.
+    Une ligne par jour de la semaine ; les jours sans séance = 'Repos'.
+    """
+    sessions = realise.get(user_number) or []
+    week = [s for s in sessions if start_date <= (s.get("date") or "") <= end_date]
+    # Regroupe par date
+    par_date: dict = {}
+    for s in week:
+        par_date.setdefault(s.get("date"), []).append(s)
+    lignes = ["| Jour | Date | Séance(s) | Données | RPE |", "|------|------|-----------|---------|-----|"]
+    try:
+        d0 = datetime.strptime(start_date, "%Y-%m-%d").date()
+        d1 = datetime.strptime(end_date, "%Y-%m-%d").date()
+    except ValueError:
+        return ""
+    cur = d0
+    while cur <= d1:
+        ds = cur.strftime("%Y-%m-%d")
+        jour = _JOURS_FR[cur.weekday()].capitalize()
+        ss = sorted(par_date.get(ds, []), key=lambda x: x.get("moment", ""))
+        if not ss:
+            lignes.append(f"| {jour} | {cur.strftime('%d/%m')} | Repos | — | — |")
+        else:
+            seances = " + ".join(
+                f"{x.get('type','')}{(' ('+x['moment']+')') if x.get('moment') else ''}" for x in ss
+            )
+            donnees = " / ".join(x.get("donnees", "") for x in ss if x.get("donnees"))
+            rpes = ", ".join(str(x.get("rpe")) for x in ss if str(x.get("rpe") or "").strip())
+            lignes.append(f"| {jour} | {cur.strftime('%d/%m')} | {seances} | {donnees or '—'} | {rpes or '—'} |")
+        cur += timedelta(days=1)
+    return "\n".join(lignes)
+
+
+def _parse_pace_sec(text: str):
+    """Extrait une allure en secondes/km depuis un texte (6'32, 6:32, 6'32\"/km...)."""
+    import re
+    m = re.search(r"(\d)\s*['h:]\s*(\d{2})\s*[\"']?\s*/?\s*km", text or "")
+    if m:
+        return int(m.group(1)) * 60 + int(m.group(2))
+    return None
+
+
+def _parse_fc(text: str):
+    """Extrait une FC (bpm) plausible depuis un texte (FC 150, FC moy 148, 150 bpm)."""
+    import re
+    m = re.search(r"(?:FC|fc)[^\d]{0,8}(\d{2,3})", text or "")
+    if not m:
+        m = re.search(r"(\d{2,3})\s*bpm", text or "")
+    if m:
+        v = int(m.group(1))
+        if 80 <= v <= 220:
+            return v
+    return None
+
+
+def compute_aerobic_trend(user_number: str, ref_date: str = None, days: int = 35) -> dict:
+    """
+    Tendance aérobie via l'Efficiency Factor (EF = vitesse / FC) sur les séances Z2/longues/seuil.
+    EF qui monte = le cœur descend à allure égale = aérobie qui progresse (le but de la phase Fondations).
+    Calculé EN PYTHON depuis le réalisé. Ne lève jamais. {} si moins de 2 points exploitables.
+    """
+    try:
+        sessions = realise.get(user_number) or []
+        paris = pytz.timezone("Europe/Paris")
+        ref = datetime.strptime(ref_date, "%Y-%m-%d").date() if ref_date else datetime.now(paris).date()
+        start = ref - timedelta(days=days)
+        pts = []
+        for s in sessions:
+            t = (s.get("type") or "").lower()
+            if not any(k in t for k in ("z2", "sortie longue", "seuil")):
+                continue
+            try:
+                d = datetime.strptime((s.get("date") or "").strip(), "%Y-%m-%d").date()
+            except ValueError:
+                continue
+            if not (start <= d <= ref):
+                continue
+            text = f"{s.get('donnees', '')} {s.get('detail', '')}"
+            pace, fc = _parse_pace_sec(text), _parse_fc(text)
+            if not pace or not fc:
+                continue
+            ef = round((60000.0 / pace) / fc, 3)  # mètres/minute par bpm
+            pts.append({"date": s.get("date"), "pace": pace, "fc": fc, "ef": ef})
+        if len(pts) < 2:
+            return {}
+        pts.sort(key=lambda x: x["date"])
+        half = max(1, len(pts) // 2)
+        old, new = pts[:half], pts[half:]
+        ef_old = sum(p["ef"] for p in old) / len(old)
+        ef_new = sum(p["ef"] for p in new) / len(new)
+        delta = round((ef_new - ef_old) / ef_old * 100, 1) if ef_old else 0.0
+        verdict = ("EN HAUSSE (aérobie qui progresse)" if delta >= 3
+                   else "EN BAISSE (à surveiller : fatigue, chaleur ou stagnation)" if delta <= -3
+                   else "STABLE")
+        return {"points": pts, "ef_old": round(ef_old, 3), "ef_new": round(ef_new, 3),
+                "delta_pct": delta, "verdict": verdict}
+    except Exception as e:
+        print(f"[aero] erreur pour {user_number}: {e}")
+        return {}
+
+
+def format_aerobic_trend(user_number: str, ref_date: str = None) -> str:
+    """Bloc INDICATEUR AÉROBIE (EF calculé) pour le bilan — donne un verdict CHIFFRÉ vs 'stable' vague."""
+    tr = compute_aerobic_trend(user_number, ref_date)
+    if not tr:
+        return ""
+    def ps(sec):
+        return f"{sec // 60}'{sec % 60:02d}/km"
+    serie = " | ".join(f"{p['date'][5:]}: {ps(p['pace'])}@{p['fc']}bpm (EF {p['ef']})" for p in tr["points"][-6:])
+    signe = "+" if tr["delta_pct"] >= 0 else ""
+    return (
+        "═══ INDICATEUR AÉROBIE — Efficiency Factor (CALCULÉ : vitesse/FC, ↑ = cœur qui descend à allure égale) ═══\n"
+        f"{serie}\n"
+        f"Tendance EF : {tr['ef_old']} → {tr['ef_new']} ({signe}{tr['delta_pct']}%) = {tr['verdict']}\n"
+        "C'est LA métrique de la phase Fondations. Donne un verdict CHIFFRÉ là-dessus — JAMAIS un 'stable/bien tenu' vague."
+    )
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -589,14 +754,21 @@ def compute_load_state(user_number: str, ref_date: str = None) -> dict:
             return {}
         first_day = min(d for d, _ in window)
         jours_data = min((ref - first_day).days + 1, 28)
-        semaines_obs = max(1.0, jours_data / 7.0)
 
         charges = [((ref - d).days, _session_rpe(s) * _session_minutes(s), s) for d, s in window]
-        total_28j = sum(c for _, c, _ in charges)
         charge_7j = sum(c for age, c, _ in charges if age < 7)
         charge_3j = sum(c for age, c, _ in charges if age < 3)
-        charge_hebdo_moy = total_28j / semaines_obs
+
+        # Moyenne CHRONIQUE robuste aux trous : on découpe la fenêtre en 4 semaines (par âge)
+        # et on ne moyenne QUE les semaines contenant au moins une séance. Une semaine vide
+        # (vacances, blessure, trou de données) ne doit pas écraser la baseline et gonfler le ratio.
+        charge_par_semaine = [0.0, 0.0, 0.0, 0.0]  # [0-6j, 7-13j, 14-20j, 21-27j]
+        for age, c, _ in charges:
+            charge_par_semaine[min(age // 7, 3)] += c
+        semaines_pleines = [c for c in charge_par_semaine if c > 0]
+        charge_hebdo_moy = sum(semaines_pleines) / len(semaines_pleines) if semaines_pleines else 0.0
         ratio = round(charge_7j / charge_hebdo_moy, 2) if charge_hebdo_moy > 0 else 0.0
+        nb_semaines_pleines = len(semaines_pleines)
 
         seances_7j = [s for age, c, s in charges if age < 7 and (s.get("type") or "").lower() != "repos"]
         par_jour: dict = {}
@@ -630,7 +802,8 @@ def compute_load_state(user_number: str, ref_date: str = None) -> dict:
             "seances_7j": len(seances_7j),
             "doubles_7j": doubles_7j,
             "jours_data": jours_data,
-            "calibration": jours_data < 14,
+            "semaines_pleines": nb_semaines_pleines,
+            "calibration": nb_semaines_pleines < 3,
         }
     except Exception as e:
         print(f"[charge] erreur compute_load_state pour {user_number}: {e}")
@@ -649,8 +822,8 @@ def format_load_state(user_number: str, ref_date: str = None) -> str:
         f"Charge hebdo moyenne observée : {st['charge_hebdo_moy']} pts → RATIO aigu/chronique : {st['ratio']} = ZONE {st['zone']}",
     ]
     if st["calibration"]:
-        lines.append(f"⚠️ Calibration en cours ({st['jours_data']} jours de données — fiabilité complète à 14j) : "
-                     "croise avec le ressenti déclaré de Louis avant toute décision ferme.")
+        lines.append(f"⚠️ Calibration en cours ({st.get('semaines_pleines', 0)} semaine(s) de données pleines — "
+                     "fiabilité complète à 3) : le ratio est indicatif, croise avec le ressenti déclaré de Louis.")
     if st.get("rpe_max_48h", 0) >= 8:
         lines.append(
             f"🔥 FATIGUE AIGUË : RPE {st['rpe_max_48h']:.0f}/10 déclaré dans les dernières 48h — ce signal PRIME sur le ratio. "
@@ -948,6 +1121,9 @@ K. RPE — LE CARBURANT DE TON MOTEUR DE CHARGE
 Après chaque débrief de séance où Louis n'a pas donné son effort perçu, demande UNE fois : "RPE sur 10 ?".
 C'est la donnée qui calibre ton état de charge — explique-le-lui si besoin. Jamais deux relances.
 
+L. CE QUE LOUIS DIT MAINTENANT > TA MÉMOIRE
+Si Louis affirme quelque chose qui contredit une note de ta mémoire (ex: "j'ai pas de ceinture de lest" alors que ta mémoire dit le contraire), c'est LOUIS qui a raison. Tu ne le contredis pas avec ta mémoire, tu adoptes son info immédiatement et tu adaptes. Ta mémoire peut être périmée ; lui sait ce qui est vrai aujourd'hui.
+
 G. SIGNAUX & RENDEZ-VOUS AUTOMATIQUES (mécanique système à connaître)
 
 ⚡ MOTS-CLÉS TRIGGER de Louis :
@@ -1193,6 +1369,12 @@ def _get_ai_response_locked(user_number: str, user_message: str) -> str:
     plan_block = format_training_plan(user_number)
     if plan_block:
         system += f"\n\n{plan_block}"
+
+    # RÉALISÉ DATÉ : les séances récentes avec leur date/jour exacts, pour que Willy
+    # ne reconstruise plus les jours de tête (cause du "ce matin le fractionné").
+    realise_recent = format_realise_recent(user_number, days=10)
+    if realise_recent:
+        system += f"\n\n{realise_recent}"
 
     # MOTEUR DE CHARGE : état calculé + consignes dures (le LLM ne jauge plus la dose lui-même)
     load_block = format_load_state(user_number)
@@ -1729,56 +1911,49 @@ def weekly_summary(only_user: str = None):
                 f"dis explicitement le taux de SUIVI du plan (ce qui a été fait / sauté / ajouté) et tire-en les conséquences pour S+1."
             )
 
+        # FAITS générés EN PYTHON (jamais par le LLM) : tableau du réalisé + indicateur aérobie.
+        # Le LLM ne fait que COMMENTER ces blocs verrouillés → fini le "sled du samedi".
+        realise_table = format_realise_table(user_number, reviewed_start, reviewed_end)
+        aero_block = format_aerobic_trend(user_number, reviewed_end)
         realise_section = (
-            f"\n\n═══ SÉANCES RÉELLEMENT RÉALISÉES PAR LOUIS (SOURCE DE VÉRITÉ) ═══\n"
-            f"Voici les séances que Louis a DÉCLARÉES avoir faites cette semaine. C'est LA référence du réalisé.\n"
+            f"\n\n═══ SÉANCES RÉALISÉES (SOURCE DE VÉRITÉ — un tableau identique sera collé en tête du bilan) ═══\n"
             f"{realise_block}\n"
-            f"⚠️ RÈGLE ABSOLUE : base ton analyse du réalisé UNIQUEMENT sur cette liste. "
-            f"N'INVENTE JAMAIS une séance qui n'y figure pas (ex: ne dis pas qu'il a fait un fractionné s'il n'est pas listé). "
-            f"Si une séance prévue n'apparaît pas ici, c'est qu'elle a sauté — dis-le."
+            f"⚠️ NE RÉÉCRIS PAS ce tableau et ne reliste PAS les séances jour par jour (c'est déjà fait automatiquement). "
+            f"Tu t'appuies dessus pour ANALYSER. N'invente jamais une séance absente de cette liste ; "
+            f"une séance prévue absente = elle a sauté, dis-le."
             if realise_block else
-            f"\n\n═══ SÉANCES RÉALISÉES (déclaratif) ═══\n"
-            f"⚠️ Aucune séance déclarée n'a été loguée cette semaine. Appuie-toi sur Strava ci-dessous, "
-            f"mais reste PRUDENT : n'affirme pas une séance dont tu n'as pas la preuve, et ne déduis pas "
-            f"de séances de muscu/CrossFit/WOD à partir de Strava (Strava ne les contient pas)."
+            f"\n\n═══ SÉANCES RÉALISÉES ═══\n"
+            f"⚠️ Aucune séance déclarée cette semaine. Appuie-toi sur Strava (prudemment), ne déduis pas de muscu/WOD depuis Strava."
         )
+        aero_section = f"\n\n{aero_block}" if aero_block else ""
         # ÉTAT DE CHARGE calculé : le dosage du programme S+1 doit s'y conformer
         load_block = format_load_state(user_number, reviewed_end)
         load_section = f"\n\n{load_block}\nLe PROGRAMME S+1 doit être DOSÉ en fonction de cet état (volume et intensités)." if load_block else ""
 
         prompt = (
             f"Tu es Willy Georges, coach Hyrox professionnel. Tu fais le bilan hebdomadaire de Louis.\n\n"
-            f"Objectifs : Barcelone Hyrox (~15 nov 2026) | Milan Sub-60 (objectif principal, ~13 déc 2026). "
-            f"Raisonne en PHASES du cycle, pas en compte à rebours de jours.{phase_block}{prevu_block}"
-            f"{realise_section}{load_section}\n\n"
+            f"Objectifs : Barcelone Hyrox (mi-novembre 2026) | Milan Sub-60 (objectif principal, mi-décembre 2026). "
+            f"Raisonne en PHASES du cycle. INTERDIT d'écrire un compte à rebours en jours (jamais de 'J-XXX').{phase_block}{prevu_block}"
+            f"{realise_section}{aero_section}{load_section}\n\n"
             f"═══ DONNÉES STRAVA (CROIS-CHECK cardio uniquement, PAS la source de vérité) ═══\n"
-            f"Sert-toi de Strava pour préciser allures/FC/distances des séances de course, PAS pour "
-            f"déterminer la liste des séances faites.\n{strava_data}\n\n"
+            f"Sert-toi de Strava pour préciser allures/FC/distances, PAS pour déterminer la liste des séances.\n{strava_data}\n\n"
             f"═══ MÉMOIRE PROFIL LOUIS ═══\n{summary}\n\n"
-            f"═══ DATE DU BILAN ═══\n{today.strftime('%A %d %B %Y')}\n"
             f"La semaine S+1 va du {week_start} (lundi) au {week_end} (dimanche).\n\n"
-            f"═══ STRUCTURE OBLIGATOIRE DU BILAN ═══\n"
-            f"Sois dense, technique et précis (pas concis). Aucune section ne doit être vide ou expédiée. "
-            f"C'est le moment où tu apportes le plus de valeur à Louis vers son Sub-60.\n\n"
-            f"📊 ANALYSE QUANTITATIVE\n"
-            f"- Volume total de la semaine (km, heures, nb séances)\n"
-            f"- Distribution Z2 / Z3 / Z4 / Force / WOD / Repos\n"
-            f"- SUIVI DU PLAN : prévu vs réalisé, ce qui a sauté, ce qui a été ajouté\n"
-            f"- Comparaison vs semaine précédente si possible\n\n"
+            f"═══ STRUCTURE DU BILAN (le tableau factuel est DÉJÀ généré, ne le refais pas) ═══\n"
+            f"Dense, technique, précis. Tu apportes de la valeur vers le Sub-60.\n\n"
+            f"📊 LECTURE DE LA SEMAINE\n"
+            f"- Commente (sans le relister) le volume, la distribution Z2/Force/WOD, la charge (ratio donné), prévu vs réalisé (ce qui a sauté/été ajouté)\n\n"
             f"🧠 ANALYSE QUALITATIVE\n"
-            f"- Progrès observés concrets (FC qui descend à allure égale, allures qui s'améliorent, sensations rapportées)\n"
-            f"- Ce qui stagne ou inquiète (zone non travaillée, séance manquée, signaux faibles)\n"
-            f"- Signaux de surcharge ou sous-charge\n"
-            f"- Où en est Louis vs la CIBLE de la phase actuelle\n\n"
-            f"🎯 PROGRAMME S+1 (jour par jour, du lundi {week_start} au dimanche {week_end}, avec POURQUOI chaque séance)\n"
-            f"Détaille les 7 jours. Pour chaque jour :\n"
-            f"- Le jour de la semaine + date\n"
-            f"- La séance précise (durée, zone, allure, format, mouvements)\n"
-            f"- Le rationale en 1 phrase (pourquoi cette séance MAINTENANT, vu la phase et la charge écoulée)\n"
-            f"Inclus IMPÉRATIVEMENT au moins une séance de force (pilier permanent).\n\n"
-            f"🧭 TRAJECTOIRE (position dans le cycle, PAS de compte à rebours en jours){traj_block}\n"
-            f"- Situe Louis dans la phase actuelle : en avance / dans les temps / en retard vs la cible de phase (verdict franc, justifié par les chiffres)\n"
-            f"- Ce qui doit être ACQUIS avant de passer à la phase suivante, et comment le programme S+1 y contribue\n\n"
+            f"- Progrès via l'indicateur aérobie (EF) donné — verdict CHIFFRÉ, pas 'stable'\n"
+            f"- Ce qui stagne / inquiète / signaux de surcharge\n"
+            f"- ⚠️ RÈGLE ANTI-CONTRADICTION : ne félicite JAMAIS un fait que tu critiques ailleurs. "
+            f"Ex : partir plus vite que la cible sur le fractionné, ce n'est PAS 'bonne forme', c'est l'erreur qui flingue la récup — dis-le comme tel.\n\n"
+            f"🎯 PROGRAMME S+1 (jour par jour, du lundi {week_start} au dimanche {week_end})\n"
+            f"Les 7 jours, chacun : jour + date, séance précise (durée/zone/allure/format/mouvements), rationale en 1 phrase. "
+            f"≥1 séance de force (pilier permanent). Dose selon l'état de charge ci-dessus.\n\n"
+            f"🧭 TRAJECTOIRE & VERDICT (pas de J-XXX){traj_block}\n"
+            f"- Où en est Louis vs la cible de phase, appuyé sur l'EF\n"
+            f"- TERMINE par UN verdict tranché en une phrase : 'sur la trajectoire du Sub-60' / 'en avance' / 'en retard', justifié par l'EF et la charge\n\n"
             f"Ton : direct, technique, motivant. Tutoiement. Pas de flatterie creuse. Tu peux dire 'ma gueule' une fois si c'est sincère."
         )
         response = get_anthropic_client().messages.create(
@@ -1787,18 +1962,18 @@ def weekly_summary(only_user: str = None):
             messages=[{"role": "user", "content": prompt}],
         )
         bilan = response.content[0].text
-        # Envoi en 2 messages distincts : (1) l'analyse rétro, (2) le programme S+1.
-        # → l'analyse arrive proprement même si le programme est long, et les deux
-        #   sont visuellement séparés. send_whatsapp redécoupe chaque partie si besoin.
+        # Assemblage EN CODE : en-tête + tableau Python (faits verrouillés) + analyse LLM,
+        # puis le programme S+1 en 2e message. Le LLM ne touche jamais aux faits bruts.
+        entete = f"📊 BILAN SEMAINE — {reviewed_start} au {reviewed_end}"
+        faits = f"## CE QUI S'EST PASSÉ (relevé automatique)\n{realise_table}" if realise_table else ""
         marker = "🎯 PROGRAMME S+1"
         idx = bilan.find(marker)
         if idx > 0:
-            retro = bilan[:idx].rstrip()
-            programme = bilan[idx:].rstrip()
-            send_whatsapp(user_number, f"📊 Bilan de la semaine :\n\n{retro}")
+            retro, programme = bilan[:idx].rstrip(), bilan[idx:].rstrip()
+            send_whatsapp(user_number, "\n\n".join(x for x in [entete, faits, retro] if x))
             send_whatsapp(user_number, programme)
         else:
-            send_whatsapp(user_number, f"📊 Bilan de la semaine :\n\n{bilan}")
+            send_whatsapp(user_number, "\n\n".join(x for x in [entete, faits, bilan] if x))
 
         # MÉMOIRE PLAN : extraire la semaine S+1 du bilan et la stocker (archive prévu/réalisé).
         # Sous lock per-user (cohérence avec les messages entrants). Ne bloque jamais l'envoi du bilan.
