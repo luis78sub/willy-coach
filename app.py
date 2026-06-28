@@ -178,7 +178,46 @@ def _is_future_date(date_str: str, today_str: str) -> bool:
 
 
 def _empty_athlete_data() -> dict:
-    return {"benchmarks": {}, "body_metrics": {}, "blessures": []}
+    return {"benchmarks": {}, "body_metrics": {}, "blessures": [], "lecons": []}
+
+
+def add_lecon(user_number: str, texte: str, source: str = "louis") -> bool:
+    """
+    Ajoute une LEÇON de prépa (règle apprise) au carnet. Additif, dédup (texte normalisé),
+    cap à 20, backup avant écriture. Ne lève jamais. Retourne True si ajoutée.
+    """
+    try:
+        texte = (texte or "").strip().rstrip(".")
+        if len(texte) < 5:
+            return False
+        data = athlete_data.get(user_number) or _empty_athlete_data()
+        data.setdefault("lecons", [])
+        norm = texte.lower()
+        if any((l.get("texte", "").lower().strip()) == norm for l in data["lecons"]):
+            return False  # déjà présente
+        backup_athlete_data(user_number)
+        today = datetime.now(pytz.timezone("Europe/Paris")).strftime("%Y-%m-%d")
+        data["lecons"].append({"date": today, "texte": texte, "source": source})
+        data["lecons"] = data["lecons"][-20:]  # cap
+        athlete_data[user_number] = data
+        persist_set("athlete_data", athlete_data)
+        print(f"[lecon] {user_number}: +1 leçon")
+        return True
+    except Exception as e:
+        print(f"[lecon] erreur add_lecon pour {user_number}: {e}")
+        return False
+
+
+def format_lecons(user_number: str) -> str:
+    """Bloc LEÇONS injecté dans les prompts (chat + bilan) — règles à respecter en programmant."""
+    data = athlete_data.get(user_number) or {}
+    lecons = data.get("lecons") or []
+    if not lecons:
+        return ""
+    lines = ["📒 LEÇONS DE TA PRÉPA (règles validées par Louis — RESPECTE-LES quand tu programmes et conseilles) :"]
+    for l in lecons:
+        lines.append(f"- {l.get('texte', '')}")
+    return "\n".join(lines)
 
 
 def backup_athlete_data(user_number: str):
@@ -1240,8 +1279,10 @@ Si Louis affirme quelque chose qui contredit une note de ta mémoire (ex: "j'ai 
 G. SIGNAUX & RENDEZ-VOUS AUTOMATIQUES (mécanique système à connaître)
 
 ⚡ MOTS-CLÉS TRIGGER de Louis :
-- "wod terminé" / "wod termine" / "séance terminée" : analyse IMMÉDIATE de sa dernière activité Strava (perf, allure, FC, comparaison vs précédentes, impact sur la suite). Pas de bla-bla, droit au feedback.
+- "wod terminé" / "wod termine" / "séance terminée" : analyse IMMÉDIATE de sa dernière activité Strava (perf, allure, FC, comparaison vs précédentes, impact sur la suite). Pas de bla-bla, droit au feedback. La séance est aussi loguée automatiquement.
 - "strava" / "connecter strava" : déclenche la reconnexion OAuth (géré par le code, pas par toi).
+- "sauvegarde" : grave immédiatement la conversation en cours dans la mémoire (réalisé + carnet) — géré par le code. Si Louis veut être sûr qu'une info est notée, il tape ça.
+- "retiens : …" / "note que …" : Louis grave une LEÇON de prépa (règle permanente) — géré par le code, elle apparaît ensuite dans tes leçons. Tu peux lui suggérer d'en graver une, mais c'est LUI qui valide avec ce mot-clé.
 
 📅 RENDEZ-VOUS HEBDO AUTOMATIQUE :
 Tu envoies automatiquement un bilan structuré chaque DIMANCHE 18h Paris (analyse quanti + quali + programme S+1 + trajectoire de phase). Un check-in de pré-bilan part à 17h30 pour compléter les séances manquantes.
@@ -1499,6 +1540,11 @@ def _get_ai_response_locked(user_number: str, user_message: str) -> str:
     if cycle_block:
         system += f"\n\n{cycle_block}"
 
+    # LEÇONS de la prépa : règles validées par Louis, à respecter en programmant/conseillant
+    lecons_block = format_lecons(user_number)
+    if lecons_block:
+        system += f"\n\n{lecons_block}"
+
     if strava_data:
         system += f"\n\n{strava_data}\n\nUtilise ces données pour personnaliser tes conseils si pertinent."
         if is_new_session:
@@ -1537,6 +1583,46 @@ def _get_ai_response_locked(user_number: str, user_message: str) -> str:
     return assistant_message
 
 
+def _extract_lecon(message: str):
+    """Détecte 'retiens/note/mémorise [: que ,] <leçon>' et renvoie le texte de la leçon, sinon None."""
+    import re
+    m = re.match(r"^\s*(retiens|note|mémorise|memorise)\b\s*(?:que|qu'|:|,)?\s*(.+)$",
+                 message or "", re.IGNORECASE | re.DOTALL)
+    if m:
+        txt = m.group(2).strip()
+        if len(txt) >= 5:
+            return txt
+    return None
+
+
+def handle_retiens(sender_number: str, texte: str):
+    """Grave une leçon validée par Louis (commande 'retiens : ...'). Confirme par WhatsApp."""
+    try:
+        with get_user_lock(sender_number):
+            added = add_lecon(sender_number, texte, "louis")
+        if added:
+            send_whatsapp(sender_number, f"📒 Noté, je le retiens et je l'appliquerai dans tes programmes :\n« {texte} »")
+        else:
+            send_whatsapp(sender_number, "📒 Déjà dans tes leçons (ou trop court) — rien ajouté.")
+    except Exception as e:
+        print(f"[retiens] erreur pour {sender_number}: {e}")
+
+
+def handle_sauvegarde(sender_number: str):
+    """Commande 'sauvegarde' : logue immédiatement la conversation en cours (réalisé + carnet)."""
+    try:
+        with get_user_lock(sender_number):
+            history = conversation_histories.get(sender_number) or []
+            n_real = update_realise(sender_number, history)
+            n_data = update_athlete_data(sender_number, history)
+        if n_real or n_data:
+            send_whatsapp(sender_number, f"✅ Sauvegardé : {n_real} séance(s) loguée(s), {n_data} chiffre(s) au carnet.")
+        else:
+            send_whatsapp(sender_number, "✅ Déjà à jour — rien de nouveau à enregistrer.")
+    except Exception as e:
+        print(f"[sauvegarde] erreur pour {sender_number}: {e}")
+
+
 def process_message_async(sender_number: str, incoming_message: str):
     """
     Génère la réponse Willy en arrière-plan et l'envoie via Twilio REST API.
@@ -1547,6 +1633,13 @@ def process_message_async(sender_number: str, incoming_message: str):
         # Le découpage est désormais centralisé dans send_whatsapp (split intelligent
         # ~1500 chars sur sauts de ligne) → plus aucun message tronqué.
         send_whatsapp(sender_number, ai_response)
+        # AUTO-CAPTURE à la source (APRÈS l'envoi, pour ne pas retarder la réponse) :
+        # si Louis a déclaré une séance ou donné un RPE, on logue le réalisé à chaud.
+        low = incoming_message.lower()
+        if any(k in low for k in ["wod terminé", "wod termine", "séance terminée", "seance terminee"]) \
+                or "rpe" in low or "/10" in incoming_message:
+            with get_user_lock(sender_number):
+                update_realise(sender_number, conversation_histories.get(sender_number) or [])
     except Exception as e:
         # Sur crash thread : on log mais on n'envoie PAS de message d'excuse
         # (économie de segments Twilio + tu vois que Willy n'a pas répondu, tu sais qu'il y a un souci)
@@ -1574,6 +1667,17 @@ def webhook():
             f"&state={sender_number.replace('whatsapp:+', '')}"
         )
         twiml.message(f"Connecte ton compte Strava en cliquant sur ce lien 👇\n{auth_url}")
+        return str(twiml)
+
+    # Commande LEÇON : "retiens : ...", "note que ...", "mémorise : ..." → grave une règle de prépa
+    lecon_txt = _extract_lecon(incoming_message)
+    if lecon_txt:
+        threading.Thread(target=handle_retiens, args=(sender_number, lecon_txt), daemon=True).start()
+        return str(twiml)
+
+    # Commande SAUVEGARDE : grave tout de suite la conversation en cours (réalisé + carnet)
+    if incoming_message.lower().strip() in ["sauvegarde", "sauve", "save", "mémorise", "memorise"]:
+        threading.Thread(target=handle_sauvegarde, args=(sender_number,), daemon=True).start()
         return str(twiml)
 
     # Tous les autres messages : traitement async pour éviter timeout Twilio 15s
@@ -1715,6 +1819,8 @@ def admin_memory():
             "load_state": compute_load_state(user),
             "load_state_formatted": format_load_state(user),
             "cycle_formatted": format_cycle(user),
+            "lecons": (athlete_data.get(user) or {}).get("lecons", []),
+            "lecons_formatted": format_lecons(user),
         }, 200
 
     if action == "list_backups":
@@ -2050,6 +2156,9 @@ def weekly_summary(only_user: str = None):
         # ÉTAT DE CHARGE calculé : le dosage du programme S+1 doit s'y conformer
         load_block = format_load_state(user_number, reviewed_end)
         load_section = f"\n\n{load_block}\nLe PROGRAMME S+1 doit être DOSÉ en fonction de cet état (volume et intensités)." if load_block else ""
+        # LEÇONS de la prépa (règles validées) → le programme S+1 doit les respecter
+        lecons_block = format_lecons(user_number)
+        lecons_section = f"\n\n{lecons_block}" if lecons_block else ""
 
         # CARNET DE SEMAINES : digest de la semaine écoulée + décision du type de S+1 (build/décharge)
         reviewed_digest = compute_week_digest(user_number, reviewed_start, reviewed_end)
@@ -2072,26 +2181,25 @@ def weekly_summary(only_user: str = None):
             f"Tu es Willy Georges, coach Hyrox professionnel. Tu fais le bilan hebdomadaire de Louis.\n\n"
             f"Objectifs : Barcelone Hyrox (mi-novembre 2026) | Milan Sub-60 (objectif principal, mi-décembre 2026). "
             f"Raisonne en PHASES du cycle. INTERDIT d'écrire un compte à rebours en jours (jamais de 'J-XXX').{phase_block}{prevu_block}"
-            f"{realise_section}{aero_section}{load_section}{deload_section}\n\n"
+            f"{realise_section}{aero_section}{load_section}{deload_section}{lecons_section}\n\n"
             f"═══ DONNÉES STRAVA (CROIS-CHECK cardio uniquement, PAS la source de vérité) ═══\n"
             f"Sert-toi de Strava pour préciser allures/FC/distances, PAS pour déterminer la liste des séances.\n{strava_data}\n\n"
             f"═══ MÉMOIRE PROFIL LOUIS ═══\n{summary}\n\n"
             f"La semaine S+1 va du {week_start} (lundi) au {week_end} (dimanche).\n\n"
             f"═══ STRUCTURE DU BILAN (le tableau factuel est DÉJÀ généré, ne le refais pas) ═══\n"
             f"Dense, technique, précis. Tu apportes de la valeur vers le Sub-60.\n\n"
-            f"📊 LECTURE DE LA SEMAINE\n"
-            f"- Commente (sans le relister) le volume, la distribution Z2/Force/WOD, la charge (ratio donné), prévu vs réalisé (ce qui a sauté/été ajouté)\n\n"
-            f"🧠 ANALYSE QUALITATIVE\n"
-            f"- Progrès via l'indicateur aérobie (EF) donné — verdict CHIFFRÉ, pas 'stable'\n"
-            f"- Ce qui stagne / inquiète / signaux de surcharge\n"
-            f"- ⚠️ RÈGLE ANTI-CONTRADICTION : ne félicite JAMAIS un fait que tu critiques ailleurs. "
-            f"Ex : partir plus vite que la cible sur le fractionné, ce n'est PAS 'bonne forme', c'est l'erreur qui flingue la récup — dis-le comme tel.\n\n"
+            f"🧠 ANALYSE (bullets COURTS et scannables — les chiffres sont déjà dans les blocs ci-dessus, ne les re-raconte pas)\n"
+            f"- Volume / distribution Z2-Force-WOD / charge (ratio donné) / prévu vs réalisé (ce qui a sauté ou été ajouté)\n"
+            f"- Progrès via l'EF donné — verdict CHIFFRÉ, jamais 'stable' ; ce qui stagne / inquiète / signaux de surcharge\n"
+            f"- ⚠️ ANTI-CONTRADICTION : ne félicite JAMAIS un fait que tu critiques ailleurs (partir plus vite que la cible = erreur, pas 'bonne forme')\n\n"
+            f"💡 CE QUE TU RETIENS\n"
+            f"- 1 à 3 enseignements CONCRETS de la semaine (1 ligne chacun), tirés de ce qui s'est réellement passé\n"
+            f"- Si un enseignement mérite de devenir une règle permanente, propose à Louis de le graver : « tu veux que je le retienne ? réponds : retiens : … » (ne le stocke PAS toi-même, attends sa validation)\n\n"
+            f"🧭 VERDICT (pas de J-XXX){traj_block}\n"
+            f"- UNE phrase tranchée : 'sur la trajectoire du Sub-60' / 'en avance' / 'en retard', justifiée par l'EF et la charge, + où tu en es vs la cible de phase\n\n"
             f"🎯 PROGRAMME S+1 (jour par jour, du lundi {week_start} au dimanche {week_end})\n"
             f"Les 7 jours, chacun : jour + date, séance précise (durée/zone/allure/format/mouvements), rationale en 1 phrase. "
-            f"≥1 séance de force (pilier permanent). Dose selon l'état de charge ci-dessus.\n\n"
-            f"🧭 TRAJECTOIRE & VERDICT (pas de J-XXX){traj_block}\n"
-            f"- Où en est Louis vs la cible de phase, appuyé sur l'EF\n"
-            f"- TERMINE par UN verdict tranché en une phrase : 'sur la trajectoire du Sub-60' / 'en avance' / 'en retard', justifié par l'EF et la charge\n\n"
+            f"≥1 séance de force (pilier permanent). Dose selon l'état de charge. RESPECTE IMPÉRATIVEMENT les leçons de la prépa (ci-dessus).\n\n"
             f"Ton : direct, technique, motivant. Tutoiement. Pas de flatterie creuse. Tu peux dire 'ma gueule' une fois si c'est sincère."
         )
         response = get_anthropic_client().messages.create(
