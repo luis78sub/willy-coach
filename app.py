@@ -1306,6 +1306,144 @@ def compress_history(user_number: str, history: list[dict]) -> str:
     return response.content[0].text
 
 
+# ════════════════════════════════════════════════════════════════════
+# TOOL USE — Willy VA CHERCHER l'info au lieu d'être gavé (sélection intelligente)
+# Socle léger toujours injecté + outils appelés à la demande par le modèle.
+# ════════════════════════════════════════════════════════════════════
+TOOLS_SPEC = [
+    {
+        "name": "historique_exercice",
+        "description": "Renvoie l'historique chiffré d'un exercice/benchmark de Louis dans le temps (ex: back squat, allure Z2, fractionné, bench press, deadlift, murph, push press...). À utiliser pour répondre à 'est-ce que je progresse sur X', comparer des charges/temps/allures sur plusieurs séances.",
+        "input_schema": {"type": "object", "properties": {"nom": {"type": "string", "description": "nom de l'exercice ou benchmark recherché (ex: 'squat', 'z2', 'fractionné', 'bench')"}}, "required": ["nom"]},
+    },
+    {
+        "name": "tendance_aerobie",
+        "description": "Renvoie la tendance aérobie de Louis : Efficiency Factor (vitesse/FC) sur ses courses récentes. À utiliser pour 'est-ce que je progresse en Z2 / en aérobie', juger si la FC descend à allure donnée.",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "seances_detaillees",
+        "description": "Renvoie le détail des séances réalisées par Louis sur les N derniers jours (utile au-delà des 4 derniers jours déjà dans le contexte). À utiliser pour analyser une semaine passée précise ou un bilan sur plusieurs semaines.",
+        "input_schema": {"type": "object", "properties": {"depuis_jours": {"type": "integer", "description": "nombre de jours d'historique à remonter (ex: 14, 30)"}}, "required": ["depuis_jours"]},
+    },
+    {
+        "name": "carnet_complet",
+        "description": "Renvoie TOUT le carnet de chiffres de Louis (tous ses benchmarks/PR). À n'utiliser que pour une revue complète ou une donnée que les autres outils ne couvrent pas.",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+]
+
+
+def _tool_historique_exercice(user_number: str, nom: str) -> str:
+    bench = (athlete_data.get(user_number) or {}).get("benchmarks") or {}
+    nl = (nom or "").lower().strip()
+    matches = {k: v for k, v in bench.items() if nl and (nl in k.lower() or k.lower() in nl)}
+    if not matches and nl:
+        for k, v in bench.items():
+            if any(w and w in k.lower() for w in nl.split()):
+                matches[k] = v
+    if not matches:
+        return f"Aucun historique pour '{nom}'. Exercices disponibles : {', '.join(sorted(bench.keys())) or '(carnet vide)'}"
+    lines = []
+    for k, series in matches.items():
+        pts = ", ".join(f"{p.get('date', '?')}: {p.get('value', '')}" for p in series)
+        lines.append(f"- {k} → {pts}")
+    return "\n".join(lines)
+
+
+def execute_tool(user_number: str, name: str, inp: dict) -> str:
+    """Exécute un outil demandé par le modèle. Ne lève jamais."""
+    try:
+        inp = inp or {}
+        if name == "historique_exercice":
+            return _tool_historique_exercice(user_number, inp.get("nom", ""))
+        if name == "tendance_aerobie":
+            return format_aerobic_trend(user_number) or "Pas assez de données aérobies exploitables (besoin allure + FC)."
+        if name == "seances_detaillees":
+            j = int(inp.get("depuis_jours", 30) or 30)
+            paris = pytz.timezone("Europe/Paris")
+            end = datetime.now(paris).strftime("%Y-%m-%d")
+            start = (datetime.now(paris) - timedelta(days=j)).strftime("%Y-%m-%d")
+            return format_realise(user_number, start, end) or f"Aucune séance loguée sur les {j} derniers jours."
+        if name == "carnet_complet":
+            return format_athlete_data(user_number) or "Carnet vide."
+        return f"Outil inconnu : {name}"
+    except Exception as e:
+        return f"Erreur outil {name}: {e}"
+
+
+def build_socle(user_number: str, strava_data: str = "", wod_done: bool = False) -> str:
+    """Le SOCLE : contexte léger TOUJOURS injecté (ce qu'un coach a toujours en tête)."""
+    paris = pytz.timezone("Europe/Paris")
+    now = datetime.now(paris)
+    tomorrow = now + timedelta(days=1)
+    heure = now.strftime("%H:%M")
+    system = SYSTEM_PROMPT + (
+        f"\n\n═══ CONTEXTE TEMPOREL ═══\n"
+        f"- AUJOURD'HUI : {now.strftime('%A %d %B %Y')} — {heure}\n"
+        f"- DEMAIN : {tomorrow.strftime('%A %d %B %Y')}\n"
+        f"Quand Louis dit 'demain', c'est {tomorrow.strftime('%A')}. Pour une séance passée, recopie sa date depuis le réalisé."
+    )
+    if user_number in athlete_summaries:
+        system += f"\n\n📋 Profil de Louis :\n{athlete_summaries[user_number]}"
+    for block in (format_lecons(user_number), format_training_plan(user_number),
+                  format_load_state(user_number), format_cycle(user_number),
+                  format_realise_recent(user_number, days=7)):
+        if block:
+            system += f"\n\n{block}"
+    if strava_data:
+        system += f"\n\n{strava_data}\n\nExploite Strava quand c'est pertinent."
+    if wod_done:
+        system += (
+            "\n\n⚡ WOD TERMINÉ : Louis vient de finir sa séance. Analyse immédiatement sa dernière activité "
+            "(perf, allure, FC, comparaison), feedback précis + impact sur la suite. Termine par UNE ligne "
+            "demandant le RPE /10 + la durée s'ils manquent (la séance est loguée automatiquement)."
+        )
+    system += (
+        "\n\n🔧 OUTILS À DISPOSITION — appelle-les UNIQUEMENT si la question l'exige et que l'info n'est pas déjà ci-dessus :\n"
+        "- historique_exercice(nom) : progression chiffrée d'un exo (squat, allure Z2, fractionné, bench…)\n"
+        "- tendance_aerobie() : ton EF (vitesse/FC) pour juger la progression aérobie\n"
+        "- seances_detaillees(depuis_jours) : réalisé détaillé au-delà des 4 derniers jours\n"
+        "- carnet_complet() : tout ton carnet de chiffres\n"
+        "Question simple/casual ou déjà couverte par le contexte → réponds DIRECT, sans outil."
+    )
+    system += (
+        f"\n\n⏰ RAPPEL FINAL — DATE : nous sommes {now.strftime('%A %d %B %Y')}, {heure}. "
+        f"Si ton raisonnement conclut un autre jour, c'est ton raisonnement qui est faux, pas cette date."
+    )
+    return system
+
+
+def respond_with_tools(user_number: str, history: list, strava_data: str = "", wod_done: bool = False) -> str:
+    """Boucle tool-use : socle léger + outils à la demande. Retourne le texte final. Ne lève jamais."""
+    messages = list(history)
+    last_text = ""
+    try:
+        for _ in range(4):  # max 4 tours d'outils
+            resp = get_anthropic_client().messages.create(
+                model="claude-sonnet-4-6", max_tokens=1500,
+                system=build_socle(user_number, strava_data, wod_done),
+                tools=TOOLS_SPEC,
+                messages=messages,
+            )
+            txt = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
+            if txt:
+                last_text = txt
+            if resp.stop_reason != "tool_use":
+                return last_text
+            messages.append({"role": "assistant", "content": resp.content})
+            results = []
+            for b in resp.content:
+                if getattr(b, "type", "") == "tool_use":
+                    out = execute_tool(user_number, b.name, b.input)
+                    results.append({"type": "tool_result", "tool_use_id": b.id, "content": out})
+            messages.append({"role": "user", "content": results})
+        return last_text or "…"
+    except Exception as e:
+        print(f"[tools] erreur respond_with_tools pour {user_number}: {e}")
+        raise
+
+
 def get_ai_response(user_number: str, user_message: str) -> str:
     # Lock par utilisateur : empêche les race conditions quand plusieurs threads
     # async traitent des messages du même user en parallèle (sinon corruption mémoire)
@@ -1344,22 +1482,6 @@ def _get_ai_response_locked(user_number: str, user_message: str) -> str:
 
     paris = pytz.timezone("Europe/Paris")
     now = datetime.now(paris)
-    tomorrow = now + timedelta(days=1)
-    heure = now.strftime("%H:%M")
-    moment = "matin" if now.hour < 12 else "après-midi" if now.hour < 18 else "soir"
-    barcelone = datetime(2026, 11, 15, tzinfo=paris)
-    milan = datetime(2026, 12, 13, tzinfo=paris)
-    j_barcelone = (barcelone - now).days
-    j_milan = (milan - now).days
-    date_context = (
-        f"\n\n═══ CONTEXTE TEMPOREL STRICT (heure France) ═══\n"
-        f"- AUJOURD'HUI : {now.strftime('%A %d %B %Y')} — {heure} ({moment})\n"
-        f"- DEMAIN : {tomorrow.strftime('%A %d %B %Y')}\n"
-        f"- Barcelone Hyrox (objectif intermédiaire) : ~15 nov 2026 → J-{j_barcelone}\n"
-        f"- Milan Hyrox Sub-60 (objectif principal) : ~13 déc 2026 → J-{j_milan}\n"
-        f"Quand Louis parle de 'demain', c'est {tomorrow.strftime('%A')}. Vérifie systématiquement.\n"
-        f"Adapte tes conseils à l'heure et au moment de la journée."
-    )
 
     wod_done = any(kw in user_message.lower() for kw in ["wod terminé", "wod termine", "séance terminée", "seance terminee"])
 
@@ -1379,67 +1501,10 @@ def _get_ai_response_locked(user_number: str, user_message: str) -> str:
         strava_data = strava_cache.get(user_number, "")
         is_new_session = False
 
-    system = SYSTEM_PROMPT + date_context
-    if user_number in athlete_summaries:
-        system += f"\n\n📋 Mémoire de tes échanges précédents avec Louis :\n{athlete_summaries[user_number]}"
-
-    struct_block = format_athlete_data(user_number)
-    if struct_block:
-        system += f"\n\n{struct_block}"
-
-    plan_block = format_training_plan(user_number)
-    if plan_block:
-        system += f"\n\n{plan_block}"
-
-    # RÉALISÉ DATÉ : les séances récentes avec leur date/jour exacts, pour que Willy
-    # ne reconstruise plus les jours de tête (cause du "ce matin le fractionné").
-    realise_recent = format_realise_recent(user_number, days=10)
-    if realise_recent:
-        system += f"\n\n{realise_recent}"
-
-    # MOTEUR DE CHARGE : état calculé + consignes dures (le LLM ne jauge plus la dose lui-même)
-    load_block = format_load_state(user_number)
-    if load_block:
-        system += f"\n\n{load_block}"
-
-    # CARNET DE SEMAINES : l'arc du cycle (charge/EF par semaine) pour raisonner sur la périodisation
-    cycle_block = format_cycle(user_number)
-    if cycle_block:
-        system += f"\n\n{cycle_block}"
-
-    # LEÇONS de la prépa : règles validées par Louis, à respecter en programmant/conseillant
-    lecons_block = format_lecons(user_number)
-    if lecons_block:
-        system += f"\n\n{lecons_block}"
-
-    if strava_data:
-        system += f"\n\n{strava_data}\n\nExploite ces données quand c'est pertinent pour ta réponse (allures, FC, comparaisons)."
-        # NB : plus de "début de session forcé" — Willy répond à la question de Louis,
-        # il exploite Strava si c'est utile, il ne déballe pas un récap imposé.
-        if wod_done:
-            system += (
-                "\n\n⚡ WOD TERMINÉ : Louis vient de finir sa séance. Analyse immédiatement "
-                "sa dernière activité Strava (perf, allure, FC, comparaison avec les précédentes), "
-                "feedback précis + impact sur la suite. Termine par UNE ligne demandant le RPE /10 + "
-                "la durée s'ils manquent (la séance est loguée automatiquement)."
-            )
-
-    # RAPPEL DATE EN DERNIÈRE POSITION : les LLM pondèrent fortement la fin du contexte.
-    # Anti-bug "on est mardi" du 10/06 : le pattern des séances avait battu la date écrite en haut.
-    system += (
-        f"\n\n⏰ RAPPEL FINAL — LA DATE (prioritaire sur toute déduction) : nous sommes "
-        f"{now.strftime('%A %d %B %Y')}, il est {heure}. Si un raisonnement te fait conclure à un autre "
-        f"jour de la semaine, c'est ton raisonnement qui est faux, pas cette date."
-    )
-
-    response = get_anthropic_client().messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=1500,
-        system=system,
-        messages=history,
-    )
-
-    assistant_message = next(b.text for b in response.content if hasattr(b, "text"))
+    # TOOL USE : socle léger toujours injecté (build_socle) + Willy va chercher
+    # le détail (carnet, EF, vieux réalisé) via des outils SEULEMENT quand la question l'exige.
+    # Remplace l'ancien "gavage" où tous les blocs étaient collés à chaque message.
+    assistant_message = respond_with_tools(user_number, history, strava_data, wod_done)
     history.append({"role": "assistant", "content": assistant_message})
     persist_set("conversation_histories", conversation_histories)
     return assistant_message
