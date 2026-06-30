@@ -583,7 +583,9 @@ def format_realise(user_number: str, start_date: str, end_date: str) -> str:
         moment = s.get("moment") or ""
         moment = f" {moment}" if moment else ""
         jour = f"{s.get('jour', '')}{moment}".strip()
-        lines.append(f"- {s.get('date', '')} ({jour}) {s.get('type', '')} : {s.get('detail', '')}{d}".rstrip())
+        rpe = str(s.get("rpe") or "").strip()
+        rpe = f" · RPE {rpe}/10" if rpe else ""  # le RPE est stocké → on le MONTRE (Willy le redemandait à tort)
+        lines.append(f"- {s.get('date', '')} ({jour}) {s.get('type', '')} : {s.get('detail', '')}{d}{rpe}".rstrip())
     return "\n".join(lines)
 
 
@@ -1178,7 +1180,7 @@ Si tu viens de te planter (date, oubli, contradiction) → mode sérieux, pas de
 Tu ne clos jamais sur "à demain / à mercredi / reviens dans X jours" — c'est Louis qui décide quand il revient.
 
 ═══ MÉCANIQUE (pour info) ═══
-Géré par le code : "wod terminé" (analyse + log auto), "strava" (connexion), "sauvegarde" (grave la conv), "retiens : …" (Louis grave une leçon — tu peux en suggérer, lui valide). Bilan auto dimanche 18h (+ check-in 17h30). Mémoire détaillée = 20 derniers messages, au-delà compressé → formule clairement PR/ressentis/blessures."""
+Géré par le code : "wod terminé" (analyse + log auto), "strava" (connexion), "sauvegarde" (grave la conv), "retiens : …" (Louis grave une leçon — tu peux en suggérer, lui valide). Briefing de fin de semaine auto dimanche 18h (résumé + RPE) ; le BILAN complet, lui, se déclenche sur demande de Louis ("fais le bilan"). Mémoire détaillée = 20 derniers messages, au-delà compressé → formule clairement PR/ressentis/blessures."""
 
 MAX_HISTORY = 20
 
@@ -2114,16 +2116,16 @@ def pre_bilan_checkin(only_user: str = None):
             logged = format_realise(user_number, week_start, week_end)
             if logged:
                 msg = (
-                    "🔍 Check rapide avant ton bilan de 18h — voilà les séances que j'ai loguées cette semaine :\n\n"
+                    "🔍 Briefing de fin de semaine — voilà les séances que j'ai loguées :\n\n"
                     f"{logged}\n\n"
                     "Il manque quelque chose ? Balance les séances oubliées (+ ton RPE /10 si tu l'as). "
-                    "Sinon réponds juste 'ok' et je te sors le bilan sur cette base. 💪"
+                    "Quand t'es prêt (après ta sortie longue), dis-moi 'fais le bilan' et je te le sors complet. 💪"
                 )
             else:
                 msg = (
-                    "🔍 Avant ton bilan de 18h : je n'ai AUCUNE séance loguée cette semaine. "
-                    "Balance-moi un récap rapide de ce que t'as fait (séances + RPE /10), "
-                    "sinon le bilan tournera uniquement sur Strava. 💪"
+                    "🔍 Briefing de fin de semaine : je n'ai AUCUNE séance loguée cette semaine. "
+                    "Balance-moi un récap de ce que t'as fait (séances + RPE /10), "
+                    "puis dis-moi 'fais le bilan' quand tu veux. 💪"
                 )
             send_whatsapp(user_number, msg)
             print(f"[checkin] pré-bilan envoyé à {user_number}")
@@ -2161,11 +2163,11 @@ def daily_consolidation():
     print(f"[struct] consolidation quotidienne terminée — {total} point(s) au total")
 
 
-# Scheduler — bilan automatique chaque dimanche à 18h heure de Paris
 scheduler = BackgroundScheduler(timezone=pytz.timezone("Europe/Paris"))
-scheduler.add_job(weekly_summary, "cron", day_of_week="sun", hour=18, minute=0)
-# Check-in pré-bilan : 30 min avant, pour compléter le réalisé (séances manquantes + RPE)
-scheduler.add_job(pre_bilan_checkin, "cron", day_of_week="sun", hour=17, minute=30)
+# Dimanche 18h : BRIEFING (check-in) automatique — résume la semaine loguée + RPE et demande
+# ce qui manque. PAS de bilan complet auto (Louis fait souvent sa sortie longue à 18h) :
+# le bilan complet se déclenche SUR DEMANDE de Louis quand il est dispo.
+scheduler.add_job(pre_bilan_checkin, "cron", day_of_week="sun", hour=18, minute=0)
 # Consolidation mémoire structurée chaque jour à 2h (Paris), avant le backup externe (3h UTC = 4-5h Paris)
 scheduler.add_job(daily_consolidation, "cron", hour=2, minute=0)
 scheduler.start()
