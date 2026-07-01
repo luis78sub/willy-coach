@@ -1578,6 +1578,23 @@ def handle_sauvegarde(sender_number: str):
         print(f"[sauvegarde] erreur pour {sender_number}: {e}")
 
 
+def _wants_bilan(message: str) -> bool:
+    """Détecte une DEMANDE de bilan (tolérante : 'fais le bilan', 'lets go bilan', 'bilan stp'…).
+    Exclut les questions SUR le bilan (finissent par ?), les débriefs de séance, et les
+    mentions en passant sans mot d'intention ('on fera le bilan dimanche')."""
+    low = (message or "").lower().strip()
+    if "bilan" not in low or low.endswith("?"):
+        return False
+    if any(k in low for k in ("wod terminé", "wod termine", "séance terminée", "seance terminee")):
+        return False
+    if low in ("bilan", "le bilan"):
+        return True
+    words = set(low.replace(",", " ").replace("!", " ").replace(".", " ").split())
+    intention = {"fais", "fait", "go", "lets", "let's", "vas-y", "vasy", "balance",
+                 "envoie", "lance", "stp", "svp", "veux", "donne", "sors"}
+    return len(message) <= 60 and bool(words & intention)
+
+
 def process_message_async(sender_number: str, incoming_message: str):
     """
     Génère la réponse Willy en arrière-plan et l'envoie via Twilio REST API.
@@ -1633,6 +1650,14 @@ def webhook():
     # Commande SAUVEGARDE : grave tout de suite la conversation en cours (réalisé + carnet)
     if incoming_message.lower().strip() in ["sauvegarde", "sauve", "save", "mémorise", "memorise"]:
         threading.Thread(target=handle_sauvegarde, args=(sender_number,), daemon=True).start()
+        return str(twiml)
+
+    # Commande BILAN : route vers le VRAI pipeline weekly_summary (tableau Python verrouillé,
+    # verdict EF chiffré, stockage S+1) — sans ça la demande part dans le chat qui improvise
+    # un bilan de mémoire (RPE approximés, EF contredit — constaté sur le bilan du 28/06).
+    if _wants_bilan(incoming_message):
+        threading.Thread(target=weekly_summary, kwargs={"only_user": sender_number}, daemon=True).start()
+        twiml.message("🧮 Bilan en cours — je déroule l'analyse complète, ça arrive dans ~1 min.")
         return str(twiml)
 
     # Tous les autres messages : traitement async pour éviter timeout Twilio 15s
@@ -2027,8 +2052,9 @@ def weekly_summary(only_user: str = None):
     today = datetime.now(paris)
     week_ago = int((today.timestamp()) - 7 * 86400)
 
-    # S+1 = semaine à venir (lundi → dimanche), le bilan tombe le dimanche soir
-    next_monday = today + timedelta(days=1)
+    # S+1 = semaine à venir (lundi → dimanche). Calcule le VRAI lundi suivant quel que soit
+    # le jour de déclenchement (le bilan est désormais à la demande, plus seulement le dimanche).
+    next_monday = today + timedelta(days=((7 - today.weekday()) % 7) or 7)
     week_start = next_monday.strftime("%Y-%m-%d")
     week_end = (next_monday + timedelta(days=6)).strftime("%Y-%m-%d")
     # Semaine écoulée (= celle qu'on analyse) : lundi → dimanche (aujourd'hui)
