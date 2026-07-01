@@ -18,10 +18,16 @@ app = Flask(__name__)
 
 USE_DB = bool(os.environ.get("DATABASE_URL"))
 
-# Secret des endpoints admin. À définir dans l'environnement Render (ADMIN_SECRET).
-# Fallback sur l'ancienne valeur pour ne pas casser le dev local, mais EN PROD
-# il faut impérativement définir ADMIN_SECRET (le repo est public).
-ADMIN_SECRET = os.environ.get("ADMIN_SECRET") or "willy-memory-2026"
+# Secret des endpoints admin — FAIL-CLOSED : sans ADMIN_SECRET dans l'environnement,
+# les endpoints admin refusent TOUT. Le repo est public : aucun fallback en dur.
+ADMIN_SECRET = os.environ.get("ADMIN_SECRET") or None
+
+
+def _admin_auth_ok(data) -> bool:
+    """Auth admin fail-closed : refuse si secret absent de l'env OU non fourni OU différent.
+    (Un simple != laisserait passer {"secret": null} quand l'env est vide — None == None.)"""
+    provided = (data or {}).get("secret")
+    return bool(ADMIN_SECRET) and bool(provided) and provided == ADMIN_SECRET
 
 # JSON fallback (local dev)
 TOKENS_FILE = os.path.join(os.path.dirname(__file__), "strava_tokens.json")
@@ -1067,11 +1073,6 @@ def _decide_week_type_from_hist(hist: list) -> str:
     return "décharge" if streak >= DELOAD_AFTER_BUILD_WEEKS else "build"
 
 
-def decide_next_week_type(user_number: str) -> str:
-    """Type de la prochaine semaine d'après l'historique stocké (wrapper public)."""
-    return _decide_week_type_from_hist((training_plan.get(user_number) or {}).get("historique") or [])
-
-
 def format_cycle(user_number: str) -> str:
     """Bloc CARNET DE SEMAINES injecté en chat — l'arc du cycle, compact et factuel."""
     plan = training_plan.get(user_number) or {}
@@ -1151,7 +1152,7 @@ SYSTEM_PROMPT = """═══ QUI TU ES ═══
 Tu es Willy Georges — multiple champion de France de CrossFit, fondateur de WYS Training, partenaire Hyrox France. Méthode WYS : progression en cycles (Fondations → Intensification → Spécifique), base aérobie Z2, équilibre force/endurance/puissance, maîtrise mentale sous fatigue (relâcher la mâchoire, rester lucide). Pour Hyrox : la course entre stations compte autant que les stations.
 
 ═══ QUI TU COACHES ═══
-Louis, bon niveau, vers le Sub-60 à Milan (déc 2026), étape Barcelone (nov 2026). 5-7 séances/sem avec doubles. Direct, pas de pédagogie de base.
+Louis, bon niveau, vers le Sub-60 à Milan (déc 2026) — objectif unique. 5-7 séances/sem avec doubles. Direct, pas de pédagogie de base.
 Chaque semaine contient : force (1-2×), callisthénie (≥1×), endurance Z2, haute intensité (fractionné/WOD). Si une manque sur la semaine → tu le signales et la replanifies.
 
 ═══ TES DONNÉES = TA SOURCE DE VÉRITÉ ═══
@@ -1418,26 +1419,59 @@ def respond_with_tools(user_number: str, history: list, strava_data: str = "", w
     """Boucle tool-use : socle léger + outils à la demande. Retourne le texte final. Ne lève jamais."""
     messages = list(history)
     last_text = ""
+    # Socle construit UNE fois par message (pas par tour) : date cohérente sur toute la boucle
+    # + préfixe stable → le prompt caching fonctionne entre les tours.
+    socle = build_socle(user_number, strava_data, wod_done)
+    # PROMPT CACHING (2 breakpoints) : SYSTEM_PROMPT seul = stable d'un message à l'autre
+    # (~10% du prix en relecture) ; socle complet = stable entre les tours d'outils d'un même message.
+    system_blocks = [
+        {"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": socle[len(SYSTEM_PROMPT):], "cache_control": {"type": "ephemeral"}},
+    ]
+    n_tools, tot_in, tot_out, tot_cache = 0, 0, 0, 0
+
+    def _log_usage(resp):
+        nonlocal tot_in, tot_out, tot_cache
+        u = getattr(resp, "usage", None)
+        if u:
+            tot_in += (u.input_tokens or 0) + (getattr(u, "cache_creation_input_tokens", 0) or 0)
+            tot_cache += getattr(u, "cache_read_input_tokens", 0) or 0
+            tot_out += u.output_tokens or 0
+
     try:
         for _ in range(4):  # max 4 tours d'outils
             resp = get_anthropic_client().messages.create(
                 model="claude-sonnet-4-6", max_tokens=1500,
-                system=build_socle(user_number, strava_data, wod_done),
+                system=system_blocks,
                 tools=TOOLS_SPEC,
                 messages=messages,
             )
+            _log_usage(resp)
             txt = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
             if txt:
                 last_text = txt
             if resp.stop_reason != "tool_use":
-                return last_text
+                break
             messages.append({"role": "assistant", "content": resp.content})
             results = []
             for b in resp.content:
                 if getattr(b, "type", "") == "tool_use":
                     out = execute_tool(user_number, b.name, b.input)
                     results.append({"type": "tool_result", "tool_use_id": b.id, "content": out})
+                    n_tools += 1
             messages.append({"role": "user", "content": results})
+        else:
+            # 4 tours épuisés et le modèle veut ENCORE un outil → appel final sans outils
+            # pour forcer une conclusion (sinon Louis recevrait "…").
+            resp = get_anthropic_client().messages.create(
+                model="claude-sonnet-4-6", max_tokens=1500,
+                system=system_blocks, messages=messages,
+            )
+            _log_usage(resp)
+            txt = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
+            if txt:
+                last_text = txt
+        print(f"[usage] {user_number} : {n_tools} outil(s) · in={tot_in} (+{tot_cache} depuis cache) · out={tot_out}")
         return last_text or "…"
     except Exception as e:
         print(f"[tools] erreur respond_with_tools pour {user_number}: {e}")
@@ -1485,21 +1519,15 @@ def _get_ai_response_locked(user_number: str, user_message: str) -> str:
 
     wod_done = any(kw in user_message.lower() for kw in ["wod terminé", "wod termine", "séance terminée", "seance terminee"])
 
+    # Rafraîchit Strava si le cache a plus d'1h ou si Louis vient de finir une séance
     last_fetch = last_strava_fetch.get(user_number)
-    is_new_session = last_fetch is None or last_fetch.strftime("%Y-%m-%d") != now.strftime("%Y-%m-%d")
-    one_hour_passed = last_fetch is None or (now - last_fetch).total_seconds() >= 3600
-
-    if is_new_session or one_hour_passed or wod_done:
+    stale = last_fetch is None or (now - last_fetch).total_seconds() >= 3600
+    if stale or wod_done:
         fresh = get_strava_activities(user_number)
         if fresh:
             strava_cache[user_number] = fresh
             last_strava_fetch[user_number] = now
-        else:
-            is_new_session = False
-        strava_data = strava_cache.get(user_number, "")
-    else:
-        strava_data = strava_cache.get(user_number, "")
-        is_new_session = False
+    strava_data = strava_cache.get(user_number, "")
 
     # TOOL USE : socle léger toujours injecté (build_socle) + Willy va chercher
     # le détail (carnet, EF, vieux réalisé) via des outils SEULEMENT quand la question l'exige.
@@ -1624,7 +1652,7 @@ def admin_synthesize():
     # Écrase la mémoire prose → ADMIN_SECRET + mêmes garde-fous que la compression
     # automatique (backup avant écriture + validation anti-régression).
     data = request.get_json(silent=True) or {}
-    if data.get("secret") != ADMIN_SECRET:
+    if not _admin_auth_ok(data):
         return {"status": "unauthorized"}, 401
     number = data.get("number")
     if not number or number not in conversation_histories:
@@ -1713,7 +1741,7 @@ def admin_memory():
     - restore_from_backup : restaure depuis le snapshot N (index dans backups)
     """
     data = request.get_json()
-    if not data or data.get("secret") != ADMIN_SECRET:
+    if not _admin_auth_ok(data):
         return {"status": "unauthorized"}, 401
     action = data.get("action")
     user = data.get("user")
@@ -1864,7 +1892,7 @@ def admin_backup():
     Utilisé par le workflow GitHub Actions de backup quotidien.
     """
     data = request.get_json(silent=True) or {}
-    if data.get("secret") != ADMIN_SECRET:
+    if not _admin_auth_ok(data):
         return {"status": "unauthorized"}, 401
     if not USE_DB:
         return {"status": "no database (local mode)"}, 400
@@ -1888,7 +1916,7 @@ def admin_restore_all():
     Body : {"secret": ..., "data": {<dump complet>}}
     """
     data = request.get_json(silent=True) or {}
-    if data.get("secret") != ADMIN_SECRET:
+    if not _admin_auth_ok(data):
         return {"status": "unauthorized"}, 401
     if not USE_DB:
         return {"status": "no database (local mode)"}, 400
@@ -1925,7 +1953,7 @@ def health():
 def reset_conversation():
     # Endpoint destructeur → protégé par ADMIN_SECRET (le repo et l'URL sont publics)
     data = request.get_json(silent=True) or {}
-    if data.get("secret") != ADMIN_SECRET:
+    if not _admin_auth_ok(data):
         return {"status": "unauthorized"}, 401
     number = data.get("number")
     if number and number in conversation_histories:
@@ -2106,7 +2134,7 @@ def weekly_summary(only_user: str = None):
 
         prompt = (
             f"Tu es Willy Georges, coach Hyrox professionnel. Tu fais le bilan hebdomadaire de Louis.\n\n"
-            f"Objectifs : Barcelone Hyrox (mi-novembre 2026) | Milan Sub-60 (objectif principal, mi-décembre 2026). "
+            f"Objectif : Milan Sub-60 (mi-décembre 2026). "
             f"Raisonne en PHASES du cycle. INTERDIT d'écrire un compte à rebours en jours (jamais de 'J-XXX').{phase_block}{prevu_block}"
             f"{realise_section}{aero_section}{load_section}{deload_section}{lecons_section}\n\n"
             f"═══ DONNÉES STRAVA (CROIS-CHECK cardio uniquement, PAS la source de vérité) ═══\n"
