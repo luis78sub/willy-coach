@@ -1595,6 +1595,220 @@ def _wants_bilan(message: str) -> bool:
     return len(message) <= 60 and bool(words & intention)
 
 
+def capture_rpe_direct(user_number: str, message: str) -> bool:
+    """RPE attrapé EN CODE (pas par le LLM) : si le message contient 'RPE 6' ou '7/10',
+    attache le chiffre à la dernière séance sans RPE (≤ 48h). Déterministe — règle le cas
+    'séance capturée d'abord, RPE donné ensuite' que l'extracteur refusait de re-traiter."""
+    import re
+    m = (re.search(r"\brpe\s*[:=]?\s*(\d{1,2}(?:[.,]\d)?)\b", message, re.IGNORECASE)
+         or re.search(r"\b(\d{1,2}(?:[.,]\d)?)\s*/\s*10\b", message))
+    if not m:
+        return False
+    try:
+        val = float(m.group(1).replace(",", "."))
+    except ValueError:
+        return False
+    if not 0 <= val <= 10:
+        return False
+    try:
+        paris = pytz.timezone("Europe/Paris")
+        cutoff = (datetime.now(paris) - timedelta(hours=48)).strftime("%Y-%m-%d")
+        candidates = [s for s in (realise.get(user_number) or [])
+                      if (s.get("date") or "") >= cutoff and not str(s.get("rpe") or "").strip()]
+        if not candidates:
+            return False
+        target = max(candidates, key=lambda s: (s.get("date") or "", s.get("moment") or ""))
+        target["rpe"] = f"{val:g}"
+        persist_set("realise", realise)
+        print(f"[rpe] capture directe pour {user_number} : {target.get('date')} {target.get('type')} → RPE {val:g}")
+        return True
+    except Exception as e:
+        print(f"[rpe] erreur capture directe pour {user_number}: {e}")
+        return False
+
+
+def generate_bilan(sender_number: str, user_message: str):
+    """Bilan hebdo via le MOTEUR DU CHAT (tool-use), pas le vieux pipeline weekly_summary.
+    On fusionne le meilleur des deux :
+    - du chat : lit la conversation → connaît les ajustements NÉGOCIÉS (fini l'accusation 'tu as sauté'),
+      concis, EF tiré par outil, pas de template obèse ;
+    - du pipeline : le tableau de faits VERROUILLÉ en Python (zéro hallucination de date/RPE), rien d'autre.
+    Fenêtre = semaine lundi→dimanche TERMINÉE (fix du bug 'aujourd'hui-6' qui excluait le lundi si lancé après minuit).
+    NE programme NI ne stocke S+1 : il propose de caler la semaine ensuite (fini l'auto-écriture du plan = fini le bordel).
+    Ne lève jamais (thread d'arrière-plan)."""
+    try:
+        paris = pytz.timezone("Europe/Paris")
+        now = datetime.now(paris)
+        # dimanche de la semaine écoulée : aujourd'hui si on est dimanche, sinon le dimanche précédent
+        offset = 0 if now.weekday() == 6 else now.weekday() + 1
+        week_end = (now - timedelta(days=offset)).strftime("%Y-%m-%d")
+        week_start = (now - timedelta(days=offset + 6)).strftime("%Y-%m-%d")
+
+        with get_user_lock(sender_number):
+            # flush : logue les tout derniers débriefs (ex : la sortie longue du jour) avant de lire le réalisé
+            update_realise(sender_number, conversation_histories.get(sender_number) or [])
+            table = format_realise_table(sender_number, week_start, week_end)
+            instruction = (
+                f"[MODE BILAN — semaine écoulée {week_start} → {week_end}] "
+                "Le tableau daté des séances est DÉJÀ affiché à Louis : ne le re-liste pas, appuie-toi dessus. "
+                "Fais un bilan DENSE et sans remplissage, dans CET esprit (pas de sections rigides imposées) :\n"
+                "• Prévu vs réalisé : compare au plan de la semaine. Tu connais les ajustements NÉGOCIÉS avec Louis "
+                "dans la conversation — ne traite JAMAIS comme 'sauté' ou 'faute' une séance qu'il a déplacée ou "
+                "remplacée EN ACCORD avec toi ; présente-la comme un choix assumé.\n"
+                "• Progression aérobie : appelle l'outil tendance_aerobie() et donne un verdict EF CHIFFRÉ (jamais 'stable' vague).\n"
+                "• Ce qui progresse / stagne (charges, allures) + les alertes (séance non finie, FC anormale, RPE élevé).\n"
+                "• Verdict trajectoire : phase X/Y, sur la voie du Sub-60 ou pas — une phrase tranchée.\n"
+                "Termine par UNE ligne invitant Louis à répondre « fais la prog » quand il veut que tu cales la semaine à venir. "
+                "Tu ne programmes PAS la semaine dans ce bilan et tu ne prétends rien avoir enregistré.\n\n"
+                f"TABLEAU DES FAITS (pour ton analyse — ne le recopie pas) :\n{table or '(aucune séance loguée)'}"
+            )
+            history = list(conversation_histories.get(sender_number) or [])
+            history.append({"role": "user", "content": instruction})
+            strava_data = strava_cache.get(sender_number, "")
+            analyse = respond_with_tools(sender_number, history, strava_data)
+            # Persistance PROPRE : le vrai message de Louis + le bilan (jamais l'instruction synthétique)
+            hist = conversation_histories.setdefault(sender_number, [])
+            hist.append({"role": "user", "content": user_message})
+            hist.append({"role": "assistant", "content": analyse})
+            persist_set("conversation_histories", conversation_histories)
+
+        entete = f"📊 BILAN SEMAINE — {week_start} au {week_end}"
+        faits = f"## CE QUI S'EST PASSÉ (relevé automatique)\n{table}" if table else ""
+        send_whatsapp(sender_number, "\n\n".join(x for x in [entete, faits, analyse] if x))
+    except Exception as e:
+        print(f"[bilan] ERREUR generate_bilan pour {sender_number}: {type(e).__name__}: {e}")
+
+
+def build_dossier_prog(user_number: str) -> str:
+    """DOSSIER DE PROG — tous les faits qu'un coach doit avoir sous les yeux AVANT de programmer.
+    100% calculé (zéro LLM). Réutilise les moteurs existants (cycle/charge/EF/leçons) + 3 blocs de
+    décision : progression par exo, variété des formats, alertes. Alimente generate_prog."""
+    import re
+    paris = pytz.timezone("Europe/Paris")
+    now = datetime.now(paris)
+
+    def days_ago(ds):
+        try:
+            return (now.date() - datetime.strptime(ds, "%Y-%m-%d").date()).days
+        except Exception:
+            return None
+
+    # 1. progression / stagnation par exercice (le carnet qui parle)
+    bench = (athlete_data.get(user_number) or {}).get("benchmarks") or {}
+    prog_lines, stales = [], []
+    for nom, serie in sorted(bench.items()):
+        if not isinstance(serie, list) or not serie:
+            continue
+        pts = sorted(serie, key=lambda p: p.get("date") or "")
+        evo = " → ".join(f"{p.get('value')} ({(p.get('date') or '')[5:]})" for p in pts[-3:])
+        age = days_ago(pts[-1].get("date") or "")
+        flag = ""
+        if len(pts) == 1:
+            flag = " (1 point — pas de tendance)"
+        elif age is not None and age > 30:
+            flag = f" ⚠️ pas re-testé depuis {age}j"
+            stales.append(nom)
+        prog_lines.append(f"- {nom} : {evo}{flag}")
+    prog = "═══ PROGRESSION PAR EXERCICE (dernier point = état actuel) ═══\n" + "\n".join(prog_lines)
+    if stales:
+        prog += f"\n→ À RE-TESTER (>30j sans mesure) : {', '.join(stales[:6])}"
+
+    # 2. variété des formats (21 derniers jours)
+    cut21 = (now - timedelta(days=21)).strftime("%Y-%m-%d")
+    par_type = {}
+    for s in [s for s in (realise.get(user_number) or []) if (s.get("date") or "") >= cut21]:
+        par_type.setdefault(s.get("type") or "?", []).append(s)
+    var_lines = []
+    for t, ss in sorted(par_type.items(), key=lambda kv: -len(kv[1])):
+        details = [(x.get("detail") or "").strip().lower()[:45] for x in ss if (x.get("detail") or "").strip()]
+        rep = " ⚠️ format identique répété — varier le stimulus ?" if len(ss) >= 3 and len(set(details)) <= 1 else ""
+        var_lines.append(f"- {t} ×{len(ss)}{rep}")
+    variete = ("═══ VARIÉTÉ (21 derniers jours) ═══\n" + "\n".join(var_lines) +
+               "\nEn Fondations le SQUELETTE se répète mais le CONTENU doit progresser (allure cible, volume, "
+               "charges, format du fractionné à varier ~toutes les 3-4 sem).")
+
+    # 3. alertes (14 derniers jours)
+    cut14 = (now - timedelta(days=14)).strftime("%Y-%m-%d")
+    al = []
+    for s in [s for s in (realise.get(user_number) or []) if (s.get("date") or "") >= cut14]:
+        txt = f"{s.get('detail','')} {s.get('donnees','')}".lower()
+        dt, ty = (s.get("date") or "")[5:], s.get("type") or ""
+        if any(k in txt for k in ("non termin", "arrêt", "arret")):
+            al.append(f"- {dt} {ty} : NON TERMINÉE → format trop dur ou fatigue ce jour-là")
+        m = re.search(r"fc\s*(?:moy)?\s*(\d{3})", txt)
+        if m and ty.lower() in ("z2", "sortie longue") and int(m.group(1)) >= 148:
+            al.append(f"- {dt} {ty} : FC {m.group(1)} sur séance facile → dérive cardiaque (chaleur/fatigue ?)")
+        try:
+            if float(str(s.get("rpe") or 0).replace(",", ".")) >= 8:
+                al.append(f"- {dt} {ty} : RPE {s.get('rpe')} → grosse sollicitation, surveiller la récup")
+        except ValueError:
+            pass
+    alertes = "═══ ALERTES (14 derniers jours) ═══\n" + ("\n".join(al) if al else "- RAS")
+
+    blocs = [f"📁 DOSSIER DE PROG (calculé, {now.strftime('%A %d %B %H:%M')})",
+             format_cycle(user_number), format_load_state(user_number), format_aerobic_trend(user_number),
+             prog, variete, alertes, format_lecons(user_number)]
+    return "\n\n".join(b for b in blocs if b)
+
+
+def generate_prog(sender_number: str, user_message: str):
+    """MOTEUR DE PROG : programme la semaine à venir via dossier calculé + EXTENDED THINKING.
+    Le modèle DÉROULE une checklist en brouillon (invisible) puis écrit une semaine où CHAQUE
+    séance est justifiée par une donnée. Il PROPOSE (ne stocke pas — Louis valide ensuite).
+    Lit la conversation → respecte les contraintes négociées. Ne lève jamais."""
+    try:
+        paris = pytz.timezone("Europe/Paris")
+        now = datetime.now(paris)
+        days_ahead = (0 - now.weekday()) % 7  # prochain lundi (aujourd'hui si on est lundi)
+        wk_start = (now + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
+        wk_end = (now + timedelta(days=days_ahead + 6)).strftime("%Y-%m-%d")
+        with get_user_lock(sender_number):
+            dossier = build_dossier_prog(sender_number)
+            instruction = (
+                f"[MODE PROGRAMMATION — semaine du {wk_start} (lundi) au {wk_end} (dimanche)]\n"
+                "AVANT d'écrire un seul jour, déroule ta réflexion : que demande la phase ? que disent la charge "
+                "et l'EF ? qu'est-ce qui doit progresser (exos figés / régressés du dossier) ? qu'est-ce qui est "
+                "éculé (format à varier) ? quelles alertes ? quelles contraintes Louis a-t-il posées dans la conversation ?\n"
+                "Puis écris la semaine, 7 jours, DENSE, sans blabla :\n"
+                "- ≥1 séance de FORCE (pilier permanent), dosée selon la charge.\n"
+                "- Respecte IMPÉRATIVEMENT les leçons ET les contraintes négociées avec Louis dans la conversation "
+                "(ne les re-transgresse pas sous prétexte d'optimiser).\n"
+                "- RÈGLE DURE : chaque jour se termine par « → » + LA donnée du dossier qui justifie ce choix "
+                "(ex : « → deadlift régressé à retrouver », « → EF en baisse, volume Z2 », « → fractionné figé, varier »). "
+                "Une séance non justifiable par une donnée ne doit PAS exister.\n"
+                "- Tu PROPOSES : termine par « ça te va, ou on ajuste ? ». Ne prétends rien avoir enregistré.\n\n"
+                f"{dossier}"
+            )
+            history = list(conversation_histories.get(sender_number) or [])
+            history.append({"role": "user", "content": instruction})
+            # budget 1500 = ~50s (le client prod coupe à 60s) ; timeout dédié 120s pour la marge.
+            resp = get_anthropic_client().messages.create(
+                model="claude-sonnet-4-6", max_tokens=3500,
+                thinking={"type": "enabled", "budget_tokens": 1500},
+                system=SYSTEM_PROMPT,
+                messages=history,
+                timeout=120,
+            )
+            prog = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
+            hist = conversation_histories.setdefault(sender_number, [])
+            hist.append({"role": "user", "content": user_message})
+            hist.append({"role": "assistant", "content": prog})
+            persist_set("conversation_histories", conversation_histories)
+        send_whatsapp(sender_number, prog or "…")
+    except Exception as e:
+        print(f"[prog] ERREUR generate_prog pour {sender_number}: {type(e).__name__}: {e}")
+
+
+def _wants_prog(message: str) -> bool:
+    """Détecte une demande de PROGRAMMATION de la semaine (route vers generate_prog)."""
+    low = (message or "").lower().strip()
+    if low.endswith("?") or any(k in low for k in ("wod terminé", "séance terminée", "seance terminee")):
+        return False
+    return any(k in low for k in ("fais la prog", "fais ma prog", "la prog de la semaine", "programme la semaine",
+                                  "programme ma semaine", "cale la semaine", "cale ma semaine", "attaque la prog",
+                                  "prog s+1", "fais la programmation"))
+
+
 def process_message_async(sender_number: str, incoming_message: str):
     """
     Génère la réponse Willy en arrière-plan et l'envoie via Twilio REST API.
@@ -1608,6 +1822,10 @@ def process_message_async(sender_number: str, incoming_message: str):
         # AUTO-CAPTURE à la source (APRÈS l'envoi, pour ne pas retarder la réponse) :
         # si Louis a déclaré une séance ou donné un RPE, on logue le réalisé à chaud.
         low = incoming_message.lower()
+        # 1) RPE seul → capture directe EN CODE sur la dernière séance sans RPE (fiable, instantané)
+        with get_user_lock(sender_number):
+            capture_rpe_direct(sender_number, incoming_message)
+        # 2) débrief de séance → extraction LLM comme avant
         if any(k in low for k in ["wod terminé", "wod termine", "séance terminée", "seance terminee"]) \
                 or "rpe" in low or "/10" in incoming_message:
             with get_user_lock(sender_number):
@@ -1652,12 +1870,20 @@ def webhook():
         threading.Thread(target=handle_sauvegarde, args=(sender_number,), daemon=True).start()
         return str(twiml)
 
-    # Commande BILAN : route vers le VRAI pipeline weekly_summary (tableau Python verrouillé,
-    # verdict EF chiffré, stockage S+1) — sans ça la demande part dans le chat qui improvise
-    # un bilan de mémoire (RPE approximés, EF contredit — constaté sur le bilan du 28/06).
+    # Commande BILAN : route vers generate_bilan = le MOTEUR DU CHAT (lit la conversation, concis,
+    # faits verrouillés en Python) — et PLUS le vieux weekly_summary (template obèse + fenêtre datée
+    # buggée + auto-écriture de la semaine, à l'origine du bilan raté du 06/07). weekly_summary reste
+    # dispo via l'admin (run_weekly) pour tests, mais n'est plus le chemin de Louis.
+    # Commande PROG : route vers generate_prog = dossier calculé + extended thinking (semaine
+    # justifiée séance par séance). Détecté AVANT le bilan (formulations distinctes).
+    if _wants_prog(incoming_message):
+        threading.Thread(target=generate_prog, args=(sender_number, incoming_message), daemon=True).start()
+        twiml.message("🏗️ Je cale la semaine — je réfléchis à fond (données + périodisation), ça arrive dans ~1 min.")
+        return str(twiml)
+
     if _wants_bilan(incoming_message):
-        threading.Thread(target=weekly_summary, kwargs={"only_user": sender_number}, daemon=True).start()
-        twiml.message("🧮 Bilan en cours — je déroule l'analyse complète, ça arrive dans ~1 min.")
+        threading.Thread(target=generate_bilan, args=(sender_number, incoming_message), daemon=True).start()
+        twiml.message("🧮 Bilan en cours — je déroule l'analyse, ça arrive dans ~1 min.")
         return str(twiml)
 
     # Tous les autres messages : traitement async pour éviter timeout Twilio 15s
