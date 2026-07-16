@@ -485,6 +485,40 @@ def extract_realized_sessions(user_number: str, history: list, existing_sessions
         return []
 
 
+_JOURS_IDX = {"lundi": 0, "mardi": 1, "mercredi": 2, "jeudi": 3, "vendredi": 4, "samedi": 5, "dimanche": 6}
+
+
+def _resolve_date_from_jour(s: dict) -> str:
+    """FIX DATES : le CODE pose la date depuis le JOUR dit par Louis — l'IA se trompe en
+    convertissant 'mardi' en date (bug constaté : 'mardi' daté d'un mercredi → doublons,
+    semaines fausses). On prend la date du bon jour de semaine la plus proche de la date
+    extraite (±3 j). Jour absent/invalide → date extraite conservée."""
+    j = (s.get("jour") or "").strip().lower()
+    date_s = (s.get("date") or "").strip()
+    if j not in _JOURS_IDX:
+        return date_s
+    try:
+        d0 = datetime.strptime(date_s, "%Y-%m-%d").date()
+    except ValueError:
+        today = datetime.now(pytz.timezone("Europe/Paris")).date()
+        return (today - timedelta(days=(today.weekday() - _JOURS_IDX[j]) % 7)).strftime("%Y-%m-%d")
+    diff = (_JOURS_IDX[j] - d0.weekday()) % 7
+    if diff > 3:
+        diff -= 7
+    return (d0 + timedelta(days=diff)).strftime("%Y-%m-%d")
+
+
+def _stats_fingerprint(donnees: str):
+    """Empreinte numérique d'une séance (les chiffres de ses données, triés). Deux séances
+    aux chiffres identiques à ±2 jours = très probablement LA MÊME séance loguée deux fois
+    (constaté : la sortie longue 12km/6'20/142 aussi loguée en 'WOD samedi')."""
+    import re
+    nums = re.findall(r"\d+(?:[.,]\d+)?", donnees or "")
+    if len(nums) < 3:
+        return None  # trop peu de chiffres pour une empreinte fiable
+    return tuple(sorted(float(n.replace(",", ".")) for n in nums))
+
+
 def merge_realise(existing: list, extracted: list) -> tuple:
     """
     Fusion ADDITIVE des séances réalisées. Dédup par (date, type).
@@ -495,6 +529,8 @@ def merge_realise(existing: list, extracted: list) -> tuple:
     today_str = datetime.now(pytz.timezone("Europe/Paris")).strftime("%Y-%m-%d")
     added = 0
     for s in (extracted or []):
+        s = dict(s)
+        s["date"] = _resolve_date_from_jour(s)  # le code corrige la date depuis le jour dit
         date = (s.get("date") or "").strip()
         stype = (s.get("type") or "").strip()
         moment = (s.get("moment") or "").strip()
@@ -502,6 +538,26 @@ def merge_realise(existing: list, extracted: list) -> tuple:
             continue
         if _is_future_date(date, today_str):
             continue  # séance future → c'est du prévu, on rejette
+        # GARDE-FOU DOUBLONS : mêmes chiffres qu'une séance existante à ±2 jours → même séance,
+        # on enrichit l'existante (rpe/moment manquants) au lieu d'en créer une deuxième.
+        fp = _stats_fingerprint(s.get("donnees") or "")
+        if fp:
+            try:
+                d_new = datetime.strptime(date, "%Y-%m-%d").date()
+                twin = next(
+                    (x for x in data if _stats_fingerprint(x.get("donnees") or "") == fp
+                     and abs((datetime.strptime(x.get("date", ""), "%Y-%m-%d").date() - d_new).days) <= 2),
+                    None,
+                )
+            except ValueError:
+                twin = None
+            if twin is not None and (twin.get("date"), twin.get("type")) != (date, stype):
+                if not str(twin.get("rpe") or "").strip() and str(s.get("rpe") or "").strip():
+                    twin["rpe"] = str(s.get("rpe")).strip()
+                if not (twin.get("moment") or "") and moment:
+                    twin["moment"] = moment
+                print(f"[realise] doublon-stats évité : {date} {stype} = même séance que {twin.get('date')} {twin.get('type')}")
+                continue
         # Dédup par (date, type, moment) avec moment vide = joker : une ré-extraction de la
         # même séance sans précision de moment ne doit PAS créer un doublon ("" matche tout).
         existing_s = next(
@@ -1627,6 +1683,75 @@ def capture_rpe_direct(user_number: str, message: str) -> bool:
         return False
 
 
+def data_quality_flags(user_number: str, start: str, end: str) -> list:
+    """SANITY-CHECK des données d'une semaine, EN CODE. Détecte ce qui doit faire tiquer
+    (le vieux bilan a récité '8 séances sur 7 jours' sans broncher). Ne lève jamais."""
+    try:
+        sem = [s for s in (realise.get(user_number) or []) if start <= (s.get("date") or "") <= end]
+        flags = []
+        if len(sem) > 7:
+            flags.append(f"{len(sem)} séances sur 7 jours — invraisemblable, doublon probable")
+        # deux séances aux chiffres identiques dans la semaine = même séance loguée 2×
+        seen = {}
+        for s in sem:
+            fp = _stats_fingerprint(s.get("donnees") or "")
+            if fp and fp in seen:
+                flags.append(f"{s.get('date')} {s.get('type')} = mêmes chiffres que {seen[fp]} — doublon probable")
+            elif fp:
+                seen[fp] = f"{s.get('date')} {s.get('type')}"
+        # même type 2 jours d'affilée dont une entrée sans données = probable double log
+        by_date = sorted(sem, key=lambda x: x.get("date") or "")
+        for i, s in enumerate(by_date[:-1]):
+            n = by_date[i + 1]
+            try:
+                adj = abs((datetime.strptime(n["date"], "%Y-%m-%d") - datetime.strptime(s["date"], "%Y-%m-%d")).days) == 1
+            except (ValueError, KeyError):
+                adj = False
+            if adj and s.get("type") == n.get("type") and (not (s.get("donnees") or "").strip() or not (n.get("donnees") or "").strip()):
+                flags.append(f"{s.get('type')} le {s.get('date')} ET le {n.get('date')} (dont une sans données) — même séance loguée 2 fois ?")
+        # incohérence date/jour restante
+        for s in sem:
+            j = (s.get("jour") or "").strip().lower()
+            if j in _JOURS_IDX:
+                try:
+                    if datetime.strptime(s["date"], "%Y-%m-%d").weekday() != _JOURS_IDX[j]:
+                        flags.append(f"{s.get('date')} étiqueté '{j}' mais cette date n'est pas un {j} — date suspecte")
+                except (ValueError, KeyError):
+                    pass
+        return flags
+    except Exception as e:
+        print(f"[quality] erreur data_quality_flags pour {user_number}: {e}")
+        return []
+
+
+def bloc_saison(user_number: str) -> str:
+    """TRAJECTOIRE DE SAISON, calculée : EF moyen par mois sur les séances aérobies.
+    C'est le zoom arrière qui manquait — la baisse de FC en Z2 est l'objectif de saison de Louis,
+    le bilan doit capitaliser dessus au lieu de paniquer sur 2 sorties récentes."""
+    try:
+        mois = {}
+        for s in (realise.get(user_number) or []):
+            if not any(k in (s.get("type") or "").lower() for k in ("z2", "sortie longue", "seuil")):
+                continue
+            txt = f"{s.get('donnees', '')} {s.get('detail', '')}"
+            pace, fc = _parse_pace_sec(txt), _parse_fc(txt)
+            if not pace or not fc:
+                continue
+            m = (s.get("date") or "")[:7]
+            if m:
+                mois.setdefault(m, []).append(round((60000.0 / pace) / fc, 3))
+        if len(mois) < 2:
+            return ""
+        lignes = [f"- {m} : EF moyen {sum(v)/len(v):.3f} (meilleur {max(v):.3f}, {len(v)} sorties)"
+                  for m, v in sorted(mois.items())]
+        return ("═══ TRAJECTOIRE DE SAISON — EF PAR MOIS (calculé ; ↑ = cœur qui descend à allure égale) ═══\n"
+                + "\n".join(lignes)
+                + "\nC'est la tendance de FOND qui compte (l'objectif de saison de Louis), pas les 2 dernières sorties.")
+    except Exception as e:
+        print(f"[saison] erreur bloc_saison pour {user_number}: {e}")
+        return ""
+
+
 def generate_bilan(sender_number: str, user_message: str):
     """Bilan hebdo via le MOTEUR DU CHAT (tool-use), pas le vieux pipeline weekly_summary.
     On fusionne le meilleur des deux :
@@ -1648,19 +1773,30 @@ def generate_bilan(sender_number: str, user_message: str):
             # flush : logue les tout derniers débriefs (ex : la sortie longue du jour) avant de lire le réalisé
             update_realise(sender_number, conversation_histories.get(sender_number) or [])
             table = format_realise_table(sender_number, week_start, week_end)
+            flags = data_quality_flags(sender_number, week_start, week_end)
+            qualite = ("\n⚠️ QUALITÉ DES DONNÉES — anomalies détectées, SIGNALE un doute au lieu d'affirmer :\n"
+                       + "\n".join(f"- {f}" for f in flags) + "\n") if flags else ""
             instruction = (
                 f"[MODE BILAN — semaine écoulée {week_start} → {week_end}] "
-                "Le tableau daté des séances est DÉJÀ affiché à Louis : ne le re-liste pas, appuie-toi dessus. "
-                "Fais un bilan DENSE et sans remplissage, dans CET esprit (pas de sections rigides imposées) :\n"
-                "• Prévu vs réalisé : compare au plan de la semaine. Tu connais les ajustements NÉGOCIÉS avec Louis "
-                "dans la conversation — ne traite JAMAIS comme 'sauté' ou 'faute' une séance qu'il a déplacée ou "
-                "remplacée EN ACCORD avec toi ; présente-la comme un choix assumé.\n"
-                "• Progression aérobie : appelle l'outil tendance_aerobie() et donne un verdict EF CHIFFRÉ (jamais 'stable' vague).\n"
-                "• Ce qui progresse / stagne (charges, allures) + les alertes (séance non finie, FC anormale, RPE élevé).\n"
-                "• Verdict trajectoire : phase X/Y, sur la voie du Sub-60 ou pas — une phrase tranchée.\n"
-                "Termine par UNE ligne invitant Louis à répondre « fais la prog » quand il veut que tu cales la semaine à venir. "
+                "Le tableau daté des séances est DÉJÀ affiché à Louis : ne le re-liste pas, appuie-toi dessus.\n"
+                "Ce que Louis attend d'un bilan, DANS CET ORDRE :\n"
+                "1. SES PROGRÈS RÉELS d'abord — compare aux semaines/mois précédents (charges de force, allures, "
+                "FC en Z2, régularité des formats). Si le deadlift remonte, si la sortie longue est excellente, si le "
+                "bench progresse, si la FC descend à allure égale : DIS-LE, chiffres à l'appui. C'est ton métier de le voir.\n"
+                "2. LA TRAJECTOIRE DE SAISON — utilise le bloc EF PAR MOIS ci-dessous : la baisse de FC en Z2 est SON "
+                "objectif de saison, capitalise dessus. Ne juge JAMAIS la forme sur 2 sorties récentes.\n"
+                "3. Ce qui mérite vigilance (alertes réelles), sans dramatiser une donnée isolée ou douteuse.\n"
+                "4. Prévu vs réalisé : SEULEMENT si écart notable, 2 lignes max — et un ajustement négocié avec toi "
+                "en conversation n'est PAS une faute, c'est un choix assumé.\n"
+                "INTERDITS : re-lister les séances ; sections de remplissage (pas de « ce que je retiens » générique) ; "
+                "verdict alarmiste bâti sur une donnée suspecte ; DÉCISION IMPOSÉE — toute proposition structurante "
+                "(décharge, changement de plan) = les chiffres + une question, c'est Louis qui décide.\n"
+                "Si un chiffre te paraît invraisemblable (ex : 8 séances sur 7 jours), tu le questionnes au lieu de le réciter.\n"
+                f"{qualite}"
+                "Termine par UNE ligne invitant Louis à répondre « fais la prog » quand il veut caler la semaine à venir. "
                 "Tu ne programmes PAS la semaine dans ce bilan et tu ne prétends rien avoir enregistré.\n\n"
-                f"TABLEAU DES FAITS (pour ton analyse — ne le recopie pas) :\n{table or '(aucune séance loguée)'}"
+                f"TABLEAU DES FAITS (pour ton analyse — ne le recopie pas) :\n{table or '(aucune séance loguée)'}\n\n"
+                f"{bloc_saison(sender_number)}"
             )
             history = list(conversation_histories.get(sender_number) or [])
             history.append({"role": "user", "content": instruction})
@@ -1745,9 +1881,15 @@ def build_dossier_prog(user_number: str) -> str:
             pass
     alertes = "═══ ALERTES (14 derniers jours) ═══\n" + ("\n".join(al) if al else "- RAS")
 
+    # sanity-check sur la semaine écoulée : si la donnée est douteuse, le dossier le dit
+    fin = now.strftime("%Y-%m-%d")
+    debut7 = (now - timedelta(days=7)).strftime("%Y-%m-%d")
+    flags = data_quality_flags(user_number, debut7, fin)
+    qualite = ("⚠️ QUALITÉ DES DONNÉES — anomalies détectées, n'affirme rien de bâti dessus :\n"
+               + "\n".join(f"- {f}" for f in flags)) if flags else ""
     blocs = [f"📁 DOSSIER DE PROG (calculé, {now.strftime('%A %d %B %H:%M')})",
              format_cycle(user_number), format_load_state(user_number), format_aerobic_trend(user_number),
-             prog, variete, alertes, format_lecons(user_number)]
+             bloc_saison(user_number), prog, variete, alertes, qualite, format_lecons(user_number)]
     return "\n\n".join(b for b in blocs if b)
 
 
